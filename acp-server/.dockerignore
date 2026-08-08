@@ -1,0 +1,7 @@
+relay-server/target/
+**/target/
+**/__pycache__/
+**/*.pyc
+.git/
+*.md
+!README.md

@@ -1,0 +1,66 @@
+# ACP Relay — Dockerfile for cloud deployment
+#
+# Build:
+#   docker build -f Dockerfile.relay -t acp-relay .
+#
+# Run:
+#   docker run -d \
+#     --name acp-relay \
+#     -p 8443:8443 \
+#     -e ACP_SHARED_SECRET=your_secret \
+#     -e ACP_DB_PATH=/data/acp-messages.db \
+#     -e ACP_PORT=8443 \
+#     -v acp-relay-data:/data \
+#     --restart unless-stopped \
+#     acp-relay
+
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM rust:1.80-slim AS builder
+
+WORKDIR /build
+
+# Cache cargo registry
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/target \
+    cargo new relay
+
+COPY relay-server/Cargo.toml ./relay/
+WORKDIR /build/relay
+
+# Pre-compile deps (cached)
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/target \
+    cargo build --release
+
+# Rebuild just our crate (fast on edits)
+COPY relay-server/src ./src/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/target \
+    cargo build --release
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# No extra user — run as root inside container (network namespace is isolated)
+RUN useradd --create-home --shell /bin/bash relay
+
+COPY --from=builder /build/relay/target/release/acp-relay /usr/local/bin/acp-relay
+
+ENV RUST_LOG=info \
+    ACP_DB_PATH=/data/acp-messages.db \
+    ACP_PORT=8443
+
+EXPOSE 8443
+
+# Store data on a volume
+VOLUME ["/data"]
+
+# Run as non-root user inside the container
+USER relay
+
+CMD ["acp-relay"]

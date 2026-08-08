@@ -1,0 +1,62 @@
+[package]
+name = "acp-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "ACP Core - Agent Communication Protocol core types and logic"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+# Web framework (for server reference impl)
+axum = { version = "0.8", optional = true }
+tower = { version = "0.5", optional = true }
+tower-http = { version = "0.6", optional = true, features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# YAML config
+serde_yaml = "0.9"
+yaml-rust2 = "0.9"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"], optional = true }
+
+# WebSocket
+tokio-tungstenite = { version = "0.26", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false }
+tokio-native-tls = { version = "0.3", optional = true }
+
+# Cryptography
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID / ULID
+uuid = { version = "1", features = ["v4", "serde"] }
+ulid = "1"
+
+# System
+hostname = "0.4"
+dirs = "6"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+
+[features]
+default = ["client", "server"]
+client = ["reqwest", "tokio-tungstenite", "futures-util"]
+server = ["axum", "tower", "tower-http"]
+
+[dev-dependencies]
+tempfile = "3"

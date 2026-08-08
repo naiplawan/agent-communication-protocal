@@ -1,0 +1,27 @@
+# ACP config for relay server
+# Used by the docker-compose "relay" service
+
+config_version: 1
+updated_at: "2026-08-07T00:00:00Z"
+
+this_agent:
+  agent_id: "acp-relay"
+  machine_id: "relay"
+  http_endpoint: "http://relay:8443"
+  ws_endpoint: "ws://relay:8443"
+  capabilities:
+    - relay
+    - registry
+
+peers: []
+
+security:
+  default_auth_type: "signed-token"
+  token_ttl_seconds: 3600
+  require_https: false
+  min_tls_version: "1.2"
+
+timeouts:
+  hop_ack_ms: 5000
+  process_ack_ms: 300000
+  stream_init_ms: 10000

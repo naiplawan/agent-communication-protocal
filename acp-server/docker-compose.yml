@@ -1,0 +1,47 @@
+# ACP Docker Compose — cloud relay + mock agent
+#
+# Quick start:
+#   cp .env.example .env
+#   docker compose up --build
+
+services:
+
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile.relay
+    container_name: acp-relay
+    hostname: relay
+    ports:
+      - "8443:8443"
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      - ACP_DB_PATH=/data/acp-messages.db
+    volumes:
+      - acp-relay-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8443/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  mock-agent:
+    build:
+      context: .
+      dockerfile: mock-agent.dockerfile
+    container_name: acp-mock-agent
+    environment:
+      - ACP_RELAY_URL=http://relay:8443
+      - ACP_AGENT_ID=mock-friend
+      - ACP_MACHINE_ID=mock-docker
+      - ACP_SHARED_SECRET=${ACP_SHARED_SECRET}
+      - ACP_POLL_INTERVAL=3
+    depends_on:
+      relay:
+        condition: service_healthy
+
+volumes:
+  acp-relay-data:

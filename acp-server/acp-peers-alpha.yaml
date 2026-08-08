@@ -1,0 +1,52 @@
+# ACP config for agent-alpha (laptop-1)
+# Used by the docker-compose "alpha" service
+
+config_version: 1
+updated_at: "2026-08-06T00:00:00Z"
+
+this_agent:
+  agent_id: "agent-alpha"
+  machine_id: "laptop-1"
+  http_endpoint: "http://alpha:8443/acp/v1"
+  ws_endpoint: "ws://alpha:8443/acp/stream"
+  capabilities:
+    - frontend
+    - code-authoring
+
+peers:
+  - agent_id: "agent-beta"
+    machine_id: "server-2"
+    http_endpoint: "http://beta:8443/acp/v1"
+    ws_endpoint: "ws://beta:8443/acp/stream"
+    capabilities:
+      - backend
+      - database
+    auth:
+      type: "signed-token"
+      # secret_path set via ACP_SHARED_SECRET env var
+
+  - agent_id: "bossza007-agent"
+    machine_id: "bossza007-laptop"
+    http_endpoint: "http://172.20.28.199:8443"
+    ws_endpoint: "ws://172.20.28.199:8443"
+    capabilities:
+      - assistant
+    auth:
+      type: "signed-token"
+
+security:
+  default_auth_type: "signed-token"
+  token_ttl_seconds: 3600
+  require_https: false   # disabled for local Docker networking
+  min_tls_version: "1.2"
+
+retry:
+  max_attempts: 3
+  initial_backoff_ms: 500
+  max_backoff_ms: 10000
+  backoff_multiplier: 2.0
+
+timeouts:
+  hop_ack_ms: 5000
+  process_ack_ms: 300000
+  stream_init_ms: 10000
