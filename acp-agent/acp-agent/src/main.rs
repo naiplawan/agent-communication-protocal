@@ -119,7 +119,7 @@ async fn run_agent(config_path: Option<&str>, port: u16, use_signaling: bool) ->
     agent.on_delegate(|msg| {
         tracing::info!("[handler] Received: {}", msg.envelope.msg_id);
         None
-    });
+    }).await;
 
     if let Err(e) = server::start_server(agent, port).await {
         tracing::error!("Server error: {}", e);
@@ -158,11 +158,88 @@ async fn send_message(config_path: Option<&str>, target: &str, payload_json: &st
     }
 }
 
-async fn listen_messages(_config_path: Option<&str>, poll_interval: u64) -> ExitCode {
+async fn listen_messages(config_path: Option<&str>, poll_interval: u64) -> ExitCode {
     tracing::info!("Listening for messages (poll interval: {}s)...", poll_interval);
-    // TODO: implement polling loop
-    tracing::info!("Listen mode not yet implemented");
-    ExitCode::from(1)
+
+    let agent = match agent::ACPAgent::from_config_file(config_path).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("Failed to load config: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+
+    // Set up a delegate handler to print messages
+    agent.on_delegate(|msg| {
+        tracing::info!("[RECV] From: {}@{:?} | msg_id: {} | payload: {:?}",
+            msg.envelope.sender.agent_id,
+            msg.envelope.sender.machine_id,
+            msg.envelope.msg_id,
+            msg.payload);
+        Some(serde_json::json!({"status": "received"}))
+    }).await;
+
+    // Debug: check the handler was registered
+    tracing::info!("Handler registered, starting poll loop...");
+
+    // Get relay peer
+    let relay_peer = agent.config.peers.iter()
+        .find(|p| p.agent_id == "acp-relay")
+        .cloned();
+
+    let relay_peer = match relay_peer {
+        Some(p) => p,
+        None => {
+            tracing::error!("No relay peer found in config");
+            return ExitCode::from(1);
+        }
+    };
+
+    tracing::info!("Polling relay at {}", relay_peer.http_endpoint);
+
+    loop {
+        match agent.client.poll_pending(&relay_peer).await {
+            Ok(resp) => {
+                if let Some(messages) = resp.get("messages").and_then(|m| m.as_array()) {
+                    if !messages.is_empty() {
+                        tracing::info!("Received {} message(s)", messages.len());
+                        for msg in messages {
+                            tracing::info!("[DEBUG] Raw message: {:?}", msg);
+                            if let (Some(envelope), Some(payload)) = (msg.get("envelope"), msg.get("payload")) {
+                                tracing::info!("[DEBUG] Envelope field: {:?}", envelope);
+                                match serde_json::from_value::<acp_core::protocol::Envelope>(envelope.clone()) {
+                                    Ok(envelope) => {
+                                        tracing::info!("[DEBUG] Envelope deserialized, intent: {:?}", envelope.intent);
+                                        let message_id = envelope.msg_id.clone();
+                                        match serde_json::from_value(payload.clone()) {
+                                            Ok(payload) => {
+                                                let m = acp_core::protocol::Message {
+                                                    envelope,
+                                                    payload: Some(payload),
+                                                };
+                                                let _ = agent.process_message(m).await;
+                                                if let Err(error) = agent.client.ack_message(&relay_peer, &message_id, "hop_ack", true, true, false).await {
+                                                    tracing::warn!("[ACK] Failed for {}: {}", message_id, error);
+                                                }
+                                            }
+                                            Err(e) => tracing::warn!("[DEBUG] Payload parse error: {}", e),
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!("[DEBUG] Envelope parse error: {}", e),
+                                }
+                            } else {
+                                tracing::warn!("[DEBUG] Missing envelope or payload in message");
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Poll error: {}", e);
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(poll_interval)).await;
+    }
 }
 
 async fn doctor(config_path: Option<&str>, target: Option<&str>) -> ExitCode {

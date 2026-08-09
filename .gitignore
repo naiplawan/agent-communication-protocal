@@ -2,6 +2,10 @@
 **/target/
 **/*.pdb
 **/*.exe
+**/.next/
+**/node_modules/
+**/dist/
+**/build/
 
 # Rust
 Cargo.lock
@@ -28,3 +32,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local configuration and secrets
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.*.example

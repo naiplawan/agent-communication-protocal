@@ -1,0 +1,10 @@
+services:
+  naiplawan-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: naiplawan-agent-remote
+    env_file:
+      - path: .env.remote-agent
+        required: true
+    restart: unless-stopped

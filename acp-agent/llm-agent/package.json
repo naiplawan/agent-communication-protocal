@@ -1,0 +1,8 @@
+{
+  "name": "naiplawan-agent-llm",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@openrouter/sdk": "latest"
+  }
+}

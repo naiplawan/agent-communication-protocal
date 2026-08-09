@@ -4,7 +4,7 @@ use crate::models::{Peer, SendRequest, SendResponse, TokenClaims};
 use crate::security::{extract_agent_id, verify_token};
 use crate::store::Store;
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{AppendHeaders, IntoResponse, Response},
     Json, Router,
@@ -213,6 +213,26 @@ pub async fn get_pending(
     with_cors(Json(serde_json::json!({ "messages": messages, "count": messages.len() })))
 }
 
+// ---- Acknowledge message ----
+
+pub async fn acknowledge_message(
+    State(state): State<SharedState>,
+    Path(msg_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(msg) = verify_auth(&headers, &state.shared_secret) {
+        return auth_error(msg);
+    }
+
+    match state.store.update_status(&msg_id, "acknowledged") {
+        Ok(()) => with_cors(Json(serde_json::json!({
+            "msg_id": msg_id,
+            "status": "acknowledged",
+        }))),
+        Err(error) => error_resp(&format!("ACK_ERROR: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 // ---- Debug messages ----
 
 pub async fn debug_messages(State(state): State<SharedState>) -> impl IntoResponse {
@@ -305,6 +325,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/acp/v1/peers", axum::routing::get(get_peers))
         .route("/acp/v1/messages/send", axum::routing::post(send_message))
         .route("/acp/v1/messages/pending", axum::routing::get(get_pending))
+        .route("/acp/v1/messages/{msg_id}/ack", axum::routing::post(acknowledge_message))
         .route("/acp/v1/debug/messages", axum::routing::get(debug_messages))
         .route("/<path:_>", axum::routing::options(cors_preflight))
         .with_state(s)

@@ -13,12 +13,21 @@ acp-agent/
 │       ├── transport.rs   # HTTP/WebSocket clients
 │       ├── config.rs      # YAML config loading
 │       └── chp.rs         # Context Handoff Protocol
-└── acp-agent/     # Agent binary + CLI
-    └── src/
-        ├── main.rs        # CLI entry point
-        ├── agent.rs       # ACPAgent struct
-        ├── server.rs      # HTTP server
-        └── signaling.rs   # Relay client
+├── acp-agent/      # Rust agent binary + CLI
+│   └── src/
+│       ├── main.rs        # CLI entry point
+│       ├── agent.rs       # ACPAgent struct
+│       ├── server.rs      # HTTP server
+│       └── signaling.rs   # Relay client
+├── acp-dashboard/  # Web dashboard (Vite + React + TypeScript)
+│   ├── src/
+│   │   ├── App.tsx        # Main dashboard component
+│   │   ├── api.ts         # Dashboard API client
+│   │   ├── types.ts       # TypeScript types
+│   │   └── components/    # UI components
+│   └── vite.config.ts     # Vite bundler config
+└── llm-agent/      # LLM-powered agent (Node.js + OpenRouter SDK)
+    └── index.mjs         # Main entry point
 ```
 
 ## Features
@@ -29,11 +38,26 @@ acp-agent/
 - **Exponential backoff retry** for reliable message delivery
 - **WebSocket streaming** for large replies
 - **Relay support** for NAT traversal
+- **Web dashboard** for monitoring agent activity and inbox
 
 ## Build
 
+### Rust Agent
 ```bash
 cargo build --release
+```
+
+### Dashboard
+```bash
+cd acp-dashboard
+npm install
+npm run build
+```
+
+### LLM Agent
+```bash
+cd llm-agent
+npm install
 ```
 
 ## Run

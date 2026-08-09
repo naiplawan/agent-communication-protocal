@@ -249,10 +249,10 @@ pub fn build_router(agent: ACPAgent) -> Router {
         .route("/health", get(health))
         .route("/acp/v1/messages/send", post(send_message))
         .route("/acp/v1/messages/pending", get(get_pending))
-        .route("/acp/v1/messages/:msg_id/ack", post(ack_message))
-        .route("/acp/v1/messages/:msg_id/error", post(error_message))
+        .route("/acp/v1/messages/{msg_id}/ack", post(ack_message))
+        .route("/acp/v1/messages/{msg_id}/error", post(error_message))
         .route("/acp/v1/stream/init", post(stream_init))
-        .route("/<path:_>", options(cors_preflight))
+        .route("/{*path}", options(cors_preflight))
         .with_state(state)
 }
 

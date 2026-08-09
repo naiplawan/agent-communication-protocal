@@ -304,8 +304,8 @@ pub struct Envelope {
     pub reply_to: Option<ReplyTo>,
     #[serde(default = "Intent::default")]
     pub intent: Intent,
-    #[serde(default = "default_content_type")]
-    pub content_type: String,
+    #[serde(default)]
+    pub content_type: Option<String>,
     #[serde(default = "Priority::default")]
     pub priority: Priority,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -452,7 +452,7 @@ pub fn build_envelope(
         recipient: AgentAddr::new(recipient_agent_id, recipient_machine_id),
         reply_to,
         intent,
-        content_type: content_type.to_string(),
+        content_type: Some(content_type.to_string()),
         priority,
         deadline,
         error: None,

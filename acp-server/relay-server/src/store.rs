@@ -110,10 +110,11 @@ impl Store {
     pub fn get_all_messages(&self) -> SqlResult<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT msg_id, corr_id, recipient_agent, sender_agent, intent, status, error
-             FROM messages LIMIT 50"
+            "SELECT msg_id, corr_id, recipient_agent, sender_agent, intent, status, error, payload
+              FROM messages LIMIT 50"
         )?;
         let rows = stmt.query_map([], |row| {
+            let payload: Option<String> = row.get(7)?;
             Ok(serde_json::json!({
                 "msg_id": row.get::<_, String>(0)?,
                 "corr_id": row.get::<_, String>(1)?,
@@ -122,6 +123,7 @@ impl Store {
                 "intent": row.get::<_, String>(4)?,
                 "status": row.get::<_, String>(5)?,
                 "error": row.get::<_, Option<String>>(6)?,
+                "payload": payload.and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok()),
             }))
         })?;
         let mut result = Vec::new();

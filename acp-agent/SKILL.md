@@ -10,7 +10,8 @@ A real-time request/reply protocol enabling **Human → Agent → Agent → Huma
 ## Full Documentation
 
 - **[PROTOCOL.md](PROTOCOL.md)** — Source of truth: message envelope format, HTTP endpoints, WebSocket protocol, ack/retry mechanics, state machine, security model
-- **[SETUP.md](SETUP.md)** — Step-by-step two-machine setup guide
+- **[SETUP.md](SETUP.md)** — Standard two-machine setup guide
+- **[SETUP-LAN.md](SETUP-LAN.md)** — Two-laptop LAN setup guide
 - **[README.md](README.md)** — Architecture overview, quick start, file structure, dependencies
 
 ## When to Use This
@@ -41,62 +42,77 @@ No agent needs a global view — only local knowledge of peers.
 
 Messages sent by another human include `origin.human = "<name_or_email>"`. When a human receives such a message, the agent **must not act autonomously** — instead:
 
-1. The human opens the **Messages** page in the web UI (`http://localhost:8080/messages`)
+1. The human opens the **Inbox** page in the web UI (`http://localhost:3000/inbox`)
 2. Clicks the message to open **Message Detail**
 3. Clicks **Accept / Blocked / In Progress** to draft a reply
 4. The agent sends the human-approved response
 
 The agent never executes a task from another human without this approval gate.
 
-## Web UI (Agent Side)
+## Web UI (Dashboard)
 
-The Flask web UI at `http://localhost:8080` provides:
+The React dashboard at `http://localhost:3000` provides:
 
 | Route | Purpose |
 |-------|---------|
 | `/` | Dashboard — relay health, pending count, recent messages |
-| `/messages` | Inbox / Outbox with intent filtering |
-| `/messages/<msg_id>` | Full envelope + payload, human reply section |
+| `/inbox` | Inbox with intent filtering and human reply |
 | `/compose` | Send a new message or reply to an existing `corr_id` |
-| `/delegation` | Track delegated tasks and their delivery status |
 
 **Environment variables** (or `acp-peers.yaml`):
 
 | Variable | Description |
 |----------|-------------|
-| `ACP_RELAY_URL` | Cloud relay URL (e.g. `https://relay.example.com:8443`) |
+| `ACP_RELAY_URL` | Cloud relay URL (e.g. `http://localhost:8443`) |
 | `ACP_AGENT_ID` | This agent's identifier |
 | `ACP_MACHINE_ID` | This machine's identifier |
 | `ACP_SHARED_SECRET` | Secret for HMAC-SHA256 token signing |
 | `ACP_PEERS_PATH` | Path to `acp-peers.yaml` (optional) |
 
-## Tools
+## CLI Tools
 
-| Tool | Purpose |
-|------|---------|
-| `bin/acp-send` | Send a message to a peer |
-| `bin/acp-listen` | Long-poll for incoming messages (simple fallback) |
-| `bin/acp-ack` | Acknowledge a message |
-| `bin/acp-doctor` | Diagnose connectivity and config |
+| Command | Purpose |
+|---------|---------|
+| `acp-agent send <target> '<json>'` | Send a message to a peer |
+| `acp-agent listen` | Long-poll for incoming messages |
+| `acp-agent doctor [--target <agent>]` | Diagnose connectivity and config |
+| `acp-agent run [--port <port>]` | Start the agent server |
 
-## Agent Integration
+## Rust Agent Integration
 
-```python
-from lib.agent import ACPAgent
+```rust
+use acp_agent::{ACPAgent, chp::build_handoff};
 
-agent = ACPAgent(config_path="/etc/acp/acp-peers.yaml")
+let agent = ACPAgent::new("acp-peers.yaml").await?;
 
-@agent.on_delegate
-def handle(msg):
-    # msg.envelope has origin, sender, reply_to.path
-    # msg.payload has the task data
-    # If origin.human is set, MUST prompt human before acting
-    if msg.envelope.origin.human:
-        return agent.escalate_to_human(msg)
-    return {"result": "done", "findings": [...]}
+let bundle = build_handoff(
+    task_title,
+    acceptance_criteria,
+    ticket_id,
+    instructions,
+    delegated_by,
+);
 
-agent.run()  # starts Flask server on :8443
+agent.send_handoff("agent-beta", bundle).await?;
 ```
+
+## LLM Agent Integration
+
+The `llm-agent/` directory provides a Node.js agent powered by OpenRouter:
+
+```bash
+cd llm-agent
+cp .env.remote-agent.example .env.remote-agent
+# Edit .env.remote-agent with your settings
+docker compose -f docker-compose.remote-agent.yml up -d
+```
+
+Environment variables:
+- `ACP_RELAY_URL` — relay URL
+- `ACP_AGENT_ID` — this agent's ID
+- `ACP_MACHINE_ID` — this machine's ID
+- `ACP_SHARED_SECRET` — HMAC signing secret
+- `OPENROUTER_API_KEY` — model API key
 
 ## Security
 

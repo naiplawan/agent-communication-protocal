@@ -6,16 +6,19 @@ ACP (Agent Communication Protocol) is a self-hosted request/reply protocol for d
 
 ```text
 acp-agent/
-├── acp-core/          Shared Rust protocol types
-├── acp-agent/         Rust agent CLI and library
-├── deploy/            Friend/agent deployment files
-├── PROTOCOL.md        Protocol specification
-└── SETUP.md           Two-machine setup guide
+├── acp-core/           Shared Rust protocol types
+├── acp-agent/          Rust agent CLI and library
+├── acp-dashboard/      Web dashboard (Vite + React + TypeScript)
+├── llm-agent/          LLM-powered agent (Node.js + OpenRouter SDK)
+├── acp-peers-opencode.yaml  Example peer config for opencode relay
+├── PROTOCOL.md         Protocol specification
+├── SETUP.md            Standard setup guide
+└── SETUP-LAN.md        Two-laptop LAN setup guide
 
 acp-server/
 ├── relay-server/       Rust relay with SQLite persistence
-├── docker-compose.yml  Relay + mock-agent development stack
-└── Dockerfile         Relay server container
+├── docker-compose.yml  Relay + dashboard development stack
+└── Dockerfile.relay    Relay server container
 ```
 
 ## How it works
@@ -39,11 +42,11 @@ Each message contains an `origin`, `sender`, `recipient`, `corr_id`, and ordered
 From `acp-server/`:
 
 ```bash
-export ACP_SHARED_SECRET="$(openssl rand -hex 32)"
+cp .env.example .env  # or create manually with ACP_SHARED_SECRET
 docker compose up --build
 ```
 
-The relay listens on port `8443` and persists messages in the `acp-relay-data` Docker volume. The compose stack also starts a mock agent for local testing.
+The relay listens on port `8443` and persists messages in the `acp-relay-data` Docker volume.
 
 Check health:
 
@@ -98,7 +101,6 @@ Use HTTPS/WSS outside a trusted local network. The protocol supports HMAC-signed
 - [Protocol specification](acp-agent/PROTOCOL.md)
 - [Two-machine setup](acp-agent/SETUP.md)
 - [Agent skill/integration guide](acp-agent/SKILL.md)
-- [Friend deployment guide](acp-agent/deploy/README.md)
 
 ## Development status
 

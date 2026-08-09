@@ -178,7 +178,7 @@ impl ACPHttpClient {
         peer: &Peer,
         message: &Message,
     ) -> Result<serde_json::Value, TransportError> {
-        let url = format!("{}/messages/send", peer.http_endpoint);
+        let url = format!("{}/acp/v1/messages/send", peer.http_endpoint);
         self.do_request(
             reqwest::Method::POST,
             &url,
@@ -239,6 +239,14 @@ impl ACPHttpClient {
         self.do_request(reqwest::Method::POST, &url, Some(peer), Some(msg_id), Some(body))
             .await
     }
+
+    /// GET /acp/v1/messages/pending
+    pub async fn poll_pending(&self, peer: &Peer) -> Result<serde_json::Value, TransportError> {
+        let url = format!("{}/acp/v1/messages/pending", peer.http_endpoint);
+        self.do_request(reqwest::Method::GET, &url, Some(peer), Some("poll_pending"), None).await
+    }
+
+    // ---- Stream operations ----
 
     /// POST /acp/v1/stream/init
     pub async fn init_stream(

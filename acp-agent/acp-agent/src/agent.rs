@@ -110,36 +110,35 @@ impl ACPAgent {
     // ---- Handler registration ----
 
     /// Register a handler for DELEGATE intent messages
-    pub fn on_delegate<F>(&self, f: F)
+    pub async fn on_delegate<F>(&self, f: F)
     where
         F: Fn(Message) -> HandlerResult + Send + Sync + 'static,
     {
         let handler: MessageHandler = Arc::new(move |msg| f(msg));
-        // Use a simple string key for the intent
         let intent_str = Intent::Delegate.as_str().to_string();
-        let mut h = self.handlers.blocking_write();
+        let mut h = self.handlers.write().await;
         h.insert(intent_str, handler);
     }
 
     /// Register a handler for REPLY intent messages
-    pub fn on_reply<F>(&self, f: F)
+    pub async fn on_reply<F>(&self, f: F)
     where
         F: Fn(Message) -> HandlerResult + Send + Sync + 'static,
     {
         let handler: MessageHandler = Arc::new(move |msg| f(msg));
         let intent_str = Intent::Reply.as_str().to_string();
-        let mut h = self.handlers.blocking_write();
+        let mut h = self.handlers.write().await;
         h.insert(intent_str, handler);
     }
 
     /// Register a handler for ERROR intent messages
-    pub fn on_error<F>(&self, f: F)
+    pub async fn on_error<F>(&self, f: F)
     where
         F: Fn(Message) -> HandlerResult + Send + Sync + 'static,
     {
         let handler: MessageHandler = Arc::new(move |msg| f(msg));
         let intent_str = Intent::Error.as_str().to_string();
-        let mut h = self.handlers.blocking_write();
+        let mut h = self.handlers.write().await;
         h.insert(intent_str, handler);
     }
 
@@ -474,9 +473,12 @@ impl ACPAgent {
     pub async fn process_message(&self, message: Message) -> HandlerResult {
         *self.state.write().await = AgentState::Processing;
 
+        tracing::info!("[DEBUG] process_message called, intent: {:?}", message.envelope.intent);
+
         // Check if this is a CHP message
         if let Some(ref payload) = message.payload {
             if let Some(intent) = payload.get("intent").and_then(|v| v.as_str()) {
+                tracing::info!("[DEBUG] CHP intent found in payload: {}", intent);
                 let handoff_handlers = self.handoff_handlers.read().await;
                 if let Some(handler) = handoff_handlers.get(intent) {
                     return handler(message);
@@ -486,7 +488,9 @@ impl ACPAgent {
 
         // Standard ACP handler
         let intent_str = message.envelope.intent.as_str().to_string();
+        tracing::info!("[DEBUG] Looking for handler for intent: {}", intent_str);
         let handlers = self.handlers.read().await;
+        tracing::info!("[DEBUG] Available handlers: {:?}", handlers.keys().collect::<Vec<_>>());
 
         if let Some(handler) = handlers.get(&intent_str) {
             handler(message)

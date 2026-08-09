@@ -15,7 +15,10 @@
 #     acp-relay
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM rust:1.80-slim AS builder
+FROM rust:1.93-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
@@ -43,11 +46,13 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    wget \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 # No extra user — run as root inside container (network namespace is isolated)
-RUN useradd --create-home --shell /bin/bash relay
+RUN useradd --create-home --shell /bin/bash relay && \
+    mkdir -p /data && chown relay:relay /data
 
 COPY --from=builder /build/relay/target/release/acp-relay /usr/local/bin/acp-relay
 
