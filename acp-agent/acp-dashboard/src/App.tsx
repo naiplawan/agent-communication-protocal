@@ -45,6 +45,7 @@ import { Button } from './components/ui/button';
 
 const POLL_INTERVAL = 10_000;
 const WS_RECONNECT_DELAY = 3000;
+const WS_OPEN_TIMEOUT = 3000;
 
 type RelayStatus = { status: string; agent: string; this_agent_id?: string; this_machine_id?: string };
 
@@ -59,8 +60,6 @@ type WsMessage = {
 
 function useWebSocket(onMessage: (msg: WsMessage) => void) {
   const [connected, setConnected] = useState(false);
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const url = useMemo(() => {
     const base = (import.meta.env.VITE_RELAY_URL || '/api/relay')
       .replace(/^http/, 'ws')
@@ -68,51 +67,61 @@ function useWebSocket(onMessage: (msg: WsMessage) => void) {
     return `${base}/acp/stream/live`;
   }, []);
 
-  const connect = () => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
-    try {
-      const ws = new WebSocket(url);
-      const timeout = setTimeout(() => {
-        if (ws.readyState !== WebSocket.OPEN) {
-          ws.close();
-          setConnected(false);
-          // No relay WS endpoint — stay in polling mode
-        }
-      }, 3000);
-      ws.onopen = () => {
-        clearTimeout(timeout);
-        setConnected(true);
-      };
-      ws.onclose = () => {
-        clearTimeout(timeout);
-        setConnected(false);
-        reconnectTimer.current = setTimeout(connect, WS_RECONNECT_DELAY);
-      };
-      ws.onerror = () => {
-        clearTimeout(timeout);
-        ws.close();
-        setConnected(false);
-      };
-      ws.onmessage = (e) => {
-        try {
-          const parsed = JSON.parse(e.data) as WsMessage;
-          onMessage(parsed);
-        } catch { /* ignore parse errors */ }
-      };
-      wsRef.current = ws;
-    } catch {
-      setConnected(false);
-    }
-  };
-
-  const disconnect = () => {
-    if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
-    wsRef.current?.close();
-  };
+  // Callers pass a fresh closure every render. Holding it in a ref keeps the
+  // latest handler reachable without making it a reconnect trigger.
+  const onMessageRef = useRef(onMessage);
+  useEffect(() => {
+    onMessageRef.current = onMessage;
+  });
 
   useEffect(() => {
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let openTimer: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
+
+    const connect = () => {
+      if (cancelled) return;
+      try {
+        const ws = new WebSocket(url);
+        socket = ws;
+
+        // A relay without a live endpoint never completes the upgrade, so give
+        // up on silence and let onclose schedule the retry.
+        openTimer = setTimeout(() => {
+          if (ws.readyState !== WebSocket.OPEN) ws.close();
+        }, WS_OPEN_TIMEOUT);
+
+        ws.onopen = () => {
+          if (openTimer) clearTimeout(openTimer);
+          setConnected(true);
+        };
+        ws.onclose = () => {
+          if (openTimer) clearTimeout(openTimer);
+          setConnected(false);
+          if (!cancelled) reconnectTimer = setTimeout(connect, WS_RECONNECT_DELAY);
+        };
+        ws.onerror = () => ws.close();
+        ws.onmessage = (e) => {
+          try {
+            onMessageRef.current(JSON.parse(e.data) as WsMessage);
+          } catch {
+            /* ignore parse errors */
+          }
+        };
+      } catch {
+        setConnected(false);
+      }
+    };
+
     connect();
-    return disconnect;
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (openTimer) clearTimeout(openTimer);
+      socket?.close();
+    };
   }, [url]);
 
   return { connected };
@@ -221,6 +230,10 @@ function useData(opts: { onNewMessage?: (d: Dispatch) => void } = {}) {
   const { connected } = useWebSocket(handleWsMessage);
 
   useEffect(() => {
+    // `load` sets no state synchronously — every setState runs after the awaited
+    // fetches resolve — so this is a subscription to an external system rather
+    // than the cascading render the rule guards against.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void load();
     const interval = setInterval(() => void load(), POLL_INTERVAL);
     return () => clearInterval(interval);
