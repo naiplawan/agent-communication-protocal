@@ -212,6 +212,73 @@ async fn debug_messages(State(state): State<SharedState>) -> impl IntoResponse {
     with_cors(Json(serde_json::json!({ "messages": messages })))
 }
 
+// GET /acp/v1/messages/{msg_id}/status
+async fn message_status(
+    State(state): State<SharedState>,
+    axum::extract::Path(msg_id): axum::extract::Path<String>,
+) -> Response {
+    let agent_guard = state.agent.read().await;
+    let agent = match agent_guard.as_ref() {
+        Some(a) => a,
+        None => {
+            let mut resp =
+                Json(serde_json::json!({"error": "Agent not initialized"})).into_response();
+            *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            return with_cors(resp);
+        }
+    };
+
+    let status = agent
+        .get_all_messages()
+        .await
+        .into_iter()
+        .find(|m| m.get("msg_id").and_then(|v| v.as_str()) == Some(msg_id.as_str()))
+        .and_then(|m| m.get("status").and_then(|v| v.as_str()).map(String::from));
+
+    match status {
+        Some(status) => with_cors(Json(StatusResponse {
+            msg_id,
+            status,
+            delivered_at: None,
+        })),
+        None => {
+            let mut resp = Json(serde_json::json!({"error": "NOT_FOUND"})).into_response();
+            *resp.status_mut() = StatusCode::NOT_FOUND;
+            with_cors(resp)
+        }
+    }
+}
+
+// GET /acp/v1/capabilities
+//
+// Unauthenticated, like /health — it reports only what this agent can speak, and
+// a peer may need it before it can negotiate anything else.
+async fn capabilities(State(state): State<SharedState>) -> impl IntoResponse {
+    let agent_guard = state.agent.read().await;
+    let (agent_id, machine_id, caps) = match agent_guard.as_ref() {
+        Some(a) => (
+            a.this.agent_id.clone(),
+            a.this.machine_id.clone().unwrap_or_default(),
+            a.this.capabilities.clone(),
+        ),
+        None => ("unknown".to_string(), "unknown".to_string(), Vec::new()),
+    };
+
+    with_cors(Json(serde_json::json!({
+        "protocol_version": "1.0",
+        "agent_id": agent_id,
+        "machine_id": machine_id,
+        "role": "agent",
+        "capabilities": caps,
+        "intents": [
+            "delegate", "reply", "ack", "error",
+            "stream_start", "stream_chunk", "stream_end",
+        ],
+        "content_types": ["application/json"],
+        "auth": ["signed-token"],
+    })))
+}
+
 // GET /acp/v1/peers
 async fn get_peers(State(state): State<SharedState>) -> impl IntoResponse {
     let agent_guard = state.agent.read().await;
@@ -234,6 +301,125 @@ async fn get_peers(State(state): State<SharedState>) -> impl IntoResponse {
         })
     }).collect();
     with_cors(Json(serde_json::json!({ "peers": peers_json })))
+}
+
+// POST /acp/v1/relay/forward
+//
+// Push delivery from the relay. The relay signs a token bound to this message
+// and addressed to the envelope's recipient; we verify that, confirm the message
+// is actually for us, then hand it to the normal incoming path.
+async fn relay_forward(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(body): Json<SendRequest>,
+) -> Response {
+    let this_agent_id = {
+        let agent_guard = state.agent.read().await;
+        match agent_guard.as_ref() {
+            Some(a) => a.this.agent_id.clone(),
+            None => {
+                let mut resp =
+                    Json(serde_json::json!({"error": "Agent not initialized"})).into_response();
+                *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                return with_cors(resp);
+            }
+        }
+    };
+
+    let envelope = &body.envelope;
+    let msg_id = envelope.msg_id.clone();
+
+    if envelope.recipient.agent_id != this_agent_id {
+        tracing::warn!(
+            "[FORWARD] {} addressed to {} but this agent is {}",
+            msg_id, envelope.recipient.agent_id, this_agent_id
+        );
+        let mut resp = Json(serde_json::json!({
+            "error": "WRONG_RECIPIENT",
+            "message": format!("This agent is {}", this_agent_id),
+        }))
+        .into_response();
+        *resp.status_mut() = StatusCode::NOT_FOUND;
+        return with_cors(resp);
+    }
+
+    if let Err(reason) = verify_forward_auth(&headers, envelope) {
+        tracing::warn!("[FORWARD] Rejected {}: {}", msg_id, reason);
+        let mut resp =
+            Json(serde_json::json!({"error": "UNAUTHORIZED", "message": reason})).into_response();
+        *resp.status_mut() = StatusCode::UNAUTHORIZED;
+        return with_cors(resp);
+    }
+
+    let message = acp_core::protocol::Message {
+        envelope: body.envelope,
+        payload: body.payload,
+    };
+
+    // Processing can invoke a long-running handler and auto-reply, so acknowledge
+    // the hop now and let it run — the relay's forward call times out in 10s.
+    let agent_state = state.agent.clone();
+    let spawned_id = msg_id.clone();
+    tokio::spawn(async move {
+        let agent_guard = agent_state.read().await;
+        if let Some(agent) = agent_guard.as_ref() {
+            agent.handle_incoming(message).await;
+        } else {
+            tracing::error!("[FORWARD] Agent gone before processing {}", spawned_id);
+        }
+    });
+
+    tracing::info!("[FORWARD] Accepted {} from relay", msg_id);
+    let mut resp = Json(SendResponse {
+        msg_id,
+        status: "accepted".to_string(),
+        next_hop: None,
+        error: None,
+    })
+    .into_response();
+    *resp.status_mut() = StatusCode::ACCEPTED;
+    with_cors(resp)
+}
+
+/// Verify a relay-signed forward token.
+///
+/// The audience is checked against the envelope's own recipient rather than this
+/// agent's configured identity: the relay derives it from the same field, and the
+/// caller has already confirmed that recipient is us. Without `ACP_SHARED_SECRET`
+/// the agent is in the documented trusted-network mode and cannot verify anything.
+fn verify_forward_auth(
+    headers: &HeaderMap,
+    envelope: &acp_core::protocol::Envelope,
+) -> Result<(), String> {
+    let secret = match std::env::var("ACP_SHARED_SECRET") {
+        Ok(s) if !s.is_empty() => s,
+        _ => {
+            tracing::warn!(
+                "[FORWARD] ACP_SHARED_SECRET not set — accepting {} unauthenticated",
+                envelope.msg_id
+            );
+            return Ok(());
+        }
+    };
+
+    let header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| "Missing Authorization header".to_string())?;
+
+    let token = header
+        .strip_prefix("ACP-Token ")
+        .ok_or_else(|| "Expected 'ACP-Token <token>' authorization".to_string())?;
+
+    acp_core::security::verify_token(
+        token,
+        &secret,
+        &envelope.recipient.agent_id,
+        envelope.recipient.machine_id.as_deref().unwrap_or(""),
+        Some(&envelope.msg_id),
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 // POST /acp/v1/messages/{msg_id}/ack
@@ -301,9 +487,12 @@ pub fn build_router(agent: ACPAgent) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/acp/v1/capabilities", get(capabilities))
+        .route("/acp/v1/messages/{msg_id}/status", get(message_status))
         .route("/acp/v1/debug/messages", get(debug_messages))
         .route("/acp/v1/peers", get(get_peers))
         .route("/acp/v1/messages/send", post(send_message))
+        .route("/acp/v1/relay/forward", post(relay_forward))
         .route("/acp/v1/messages/pending", get(get_pending))
         .route("/acp/v1/messages/{msg_id}/ack", post(ack_message))
         .route("/acp/v1/messages/{msg_id}/error", post(error_message))

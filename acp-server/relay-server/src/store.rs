@@ -107,6 +107,17 @@ impl Store {
         Ok(())
     }
 
+    /// Delivery status of one message: `(status, updated_at)`.
+    pub fn get_status(&self, msg_id: &str) -> SqlResult<Option<(String, f64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT status, updated_at FROM messages WHERE msg_id = ?")?;
+        let mut rows = stmt.query(params![msg_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+            None => Ok(None),
+        }
+    }
+
     pub fn get_all_messages(&self) -> SqlResult<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

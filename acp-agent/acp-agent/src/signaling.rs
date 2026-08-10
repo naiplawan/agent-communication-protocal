@@ -110,9 +110,15 @@ impl SignalingClient {
             "capabilities": ["signaling", "agent"],
         });
 
+        // The relay registers the peer named by this token's issuer, so it must be
+        // signed as this agent — an unsigned registration is refused.
+        let reg_id = format!("reg_{}", uuid::Uuid::new_v4());
+        let token = self.make_token("acp-relay", "relay", &reg_id);
+
         let resp = self.http_client
             .post(&url)
             .json(&body)
+            .header("Authorization", format!("ACP-Token {}", token))
             .send()
             .await?;
 

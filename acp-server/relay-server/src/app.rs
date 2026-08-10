@@ -69,8 +69,32 @@ pub async fn health() -> impl IntoResponse {
 
 pub async fn register(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(peer): Json<Peer>,
 ) -> impl IntoResponse {
+    let claims = match verify_auth(&headers, &state.shared_secret) {
+        Ok(c) => c,
+        Err(msg) => return auth_error(msg),
+    };
+    if let Err(e) = check_audience(&claims, &[&state.this_agent_id]) {
+        return forbidden(e);
+    }
+
+    // A registration rewrites where the relay forwards an agent's messages, so it
+    // may only be made in the registrant's own name — otherwise any holder of the
+    // shared secret could point another agent's traffic at an endpoint it controls.
+    let issuer = agent_id_from_iss(&claims.iss);
+    if issuer != peer.agent_id {
+        warn!("[REG] {} attempted to register as {}", issuer, peer.agent_id);
+        let mut resp = Json(serde_json::json!({
+            "error": "FORBIDDEN",
+            "message": format!("Token issued by {} cannot register {}", issuer, peer.agent_id),
+        }))
+        .into_response();
+        *resp.status_mut() = StatusCode::FORBIDDEN;
+        return with_cors(resp);
+    }
+
     info!("[REG] Registering peer: {}", peer.agent_id);
     if let Err(e) = state.store.register_peer(&peer) {
         error!("[REG] Failed to register peer: {:?}", e);
@@ -91,8 +115,12 @@ pub async fn get_peers(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(msg) = verify_auth(&headers, &state.shared_secret) {
-        return auth_error(msg);
+    let claims = match verify_auth(&headers, &state.shared_secret) {
+        Ok(c) => c,
+        Err(msg) => return auth_error(msg),
+    };
+    if let Err(e) = check_audience(&claims, &[&state.this_agent_id]) {
+        return forbidden(e);
     }
     let peers = state.store.get_peers(false).unwrap_or_default();
     with_cors(Json(serde_json::json!({ "peers": peers })))
@@ -105,13 +133,20 @@ pub async fn send_message(
     headers: HeaderMap,
     Json(body): Json<SendRequest>,
 ) -> impl IntoResponse {
-    if let Err(msg) = verify_auth(&headers, &state.shared_secret) {
-        return auth_error(msg);
-    }
+    let claims = match verify_auth(&headers, &state.shared_secret) {
+        Ok(c) => c,
+        Err(msg) => return auth_error(msg),
+    };
 
     let envelope = &body.envelope;
     let msg_id = &envelope.msg_id;
     let recipient_agent = &envelope.recipient.agent_id;
+
+    // Unlike the relay's own endpoints, a send token may be addressed to the
+    // ultimate recipient — the relay is a forwarder on that path, not the target.
+    if let Err(e) = check_audience(&claims, &[&state.this_agent_id, recipient_agent]) {
+        return forbidden(e);
+    }
     let recipient_machine = envelope.recipient.machine_id.as_deref();
 
     info!("[SEND] msg_id={} -> {}", &msg_id[..8.min(msg_id.len())], recipient_agent);
@@ -147,11 +182,11 @@ pub async fn send_message(
     new_envelope.sender.machine_id = Some("relay".to_string());
     if let Some(hops) = &mut new_envelope.hops {
         hops.count += 1;
-        hops.trace.push(format!("{}@relay", state.this_agent_id));
+        hops.trace.push(crate::models::HopTraceEntry::now(&state.this_agent_id, "relay"));
     } else {
         new_envelope.hops = Some(crate::models::Hops {
             count: 1, max: 10,
-            trace: vec![format!("{}@relay", state.this_agent_id)],
+            trace: vec![crate::models::HopTraceEntry::now(&state.this_agent_id, "relay")],
         });
     }
 
@@ -172,6 +207,9 @@ pub async fn send_message(
     {
         Ok(resp) if resp.status().is_success() => {
             state.store.put(msg_id, envelope, &body.payload).ok();
+            // The push landed, so the message is delivered rather than awaiting a
+            // poll. It stays pollable until acked, per at-least-once delivery.
+            state.store.update_status(msg_id, "delivered").ok();
             info!("[SEND] Forwarded {} to {}", msg_id, peer.http_endpoint);
             with_cors(send_ok(msg_id, "forwarded", Some(&peer.http_endpoint)))
         }
@@ -207,6 +245,9 @@ pub async fn get_pending(
         Ok(c) => c,
         Err(msg) => return auth_error(msg),
     };
+    if let Err(e) = check_audience(&claims, &[&state.this_agent_id]) {
+        return forbidden(e);
+    }
     let agent_id = agent_id_from_iss(&claims.iss);
     let messages = state.store.get_all_pending(&agent_id).unwrap_or_default();
     info!("[PENDING] {} messages for {}", messages.len(), agent_id);
@@ -219,18 +260,85 @@ pub async fn acknowledge_message(
     State(state): State<SharedState>,
     Path(msg_id): Path<String>,
     headers: HeaderMap,
+    body: String,
 ) -> impl IntoResponse {
-    if let Err(msg) = verify_auth(&headers, &state.shared_secret) {
-        return auth_error(msg);
+    let claims = match verify_auth(&headers, &state.shared_secret) {
+        Ok(c) => c,
+        Err(msg) => return auth_error(msg),
+    };
+    if let Err(e) = check_audience(&claims, &[&state.this_agent_id]) {
+        return forbidden(e);
     }
 
-    match state.store.update_status(&msg_id, "acknowledged") {
+    // The body is read leniently: callers send differing shapes (`ack_type` +
+    // `received`, or the spec's `ack_id`/`processed`/`stream_available`), and some
+    // send none at all. A processed ack completes the message; anything else only
+    // confirms the hop.
+    let ack: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let processed = ack.get("processed").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ack_id = ack.get("ack_id").and_then(|v| v.as_str());
+    let status = if processed { "completed" } else { "acknowledged" };
+
+    info!(
+        "[ACK] {} -> {} (from {})",
+        msg_id, status, agent_id_from_iss(&claims.iss)
+    );
+
+    match state.store.update_status(&msg_id, status) {
         Ok(()) => with_cors(Json(serde_json::json!({
             "msg_id": msg_id,
-            "status": "acknowledged",
+            "status": status,
+            "ack_id": ack_id,
+            "recorded": true,
         }))),
         Err(error) => error_resp(&format!("ACK_ERROR: {error}"), StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+// ---- Message status ----
+
+pub async fn message_status(
+    State(state): State<SharedState>,
+    Path(msg_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let claims = match verify_auth(&headers, &state.shared_secret) {
+        Ok(c) => c,
+        Err(msg) => return auth_error(msg),
+    };
+    if let Err(e) = check_audience(&claims, &[&state.this_agent_id]) {
+        return forbidden(e);
+    }
+
+    match state.store.get_status(&msg_id) {
+        Ok(Some((status, updated_at))) => with_cors(Json(serde_json::json!({
+            "msg_id": msg_id,
+            "status": status,
+            "delivered_at": iso_from_epoch(updated_at),
+        }))),
+        Ok(None) => error_resp("NOT_FOUND", StatusCode::NOT_FOUND),
+        Err(error) => error_resp(
+            &format!("STATUS_ERROR: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+// ---- Capabilities ----
+//
+// Unauthenticated, like /health: it carries no message or peer data, and a client
+// may need it to negotiate before it can address a token correctly.
+pub async fn capabilities(State(state): State<SharedState>) -> impl IntoResponse {
+    with_cors(Json(serde_json::json!({
+        "protocol_version": "1.0",
+        "agent_id": state.this_agent_id,
+        "machine_id": "relay",
+        "role": "relay",
+        "capabilities": ["relay", "registry", "broker"],
+        "intents": ["delegate", "reply", "ack", "error"],
+        "content_types": ["application/json"],
+        "auth": ["signed-token"],
+    })))
 }
 
 // ---- Debug messages ----
@@ -271,6 +379,37 @@ fn auth_error(msg: &str) -> Response {
 
 fn agent_id_from_iss(iss: &str) -> String {
     extract_agent_id(iss)
+}
+
+/// Confirm a token was minted for one of `allowed` audiences.
+///
+/// Only the `agent_id` half of `aud` is compared. Peers derive the machine half
+/// from their own config entry for the relay, which deployments name freely, so
+/// requiring an exact match would reject correctly-signed tokens. Comparing the
+/// agent half still stops a token minted to address one agent from being replayed
+/// against another's endpoints.
+fn check_audience(claims: &TokenClaims, allowed: &[&str]) -> Result<(), String> {
+    let aud_agent = extract_agent_id(&claims.sub);
+    if allowed.iter().any(|a| *a == aud_agent) {
+        return Ok(());
+    }
+    Err(format!(
+        "Token audience {} is not valid here (expected one of: {})",
+        aud_agent,
+        allowed.join(", ")
+    ))
+}
+
+fn forbidden(message: String) -> Response {
+    let mut resp = Json(serde_json::json!({ "error": "FORBIDDEN", "message": message })).into_response();
+    *resp.status_mut() = StatusCode::FORBIDDEN;
+    with_cors(resp)
+}
+
+fn iso_from_epoch(secs: f64) -> String {
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default()
 }
 
 // ---- Token creation ----
@@ -321,7 +460,9 @@ pub fn build_router(state: AppState) -> Router {
     let s = Arc::new(state);
     Router::new()
         .route("/health", axum::routing::get(health))
+        .route("/acp/v1/capabilities", axum::routing::get(capabilities))
         .route("/acp/v1/agents/register", axum::routing::post(register))
+        .route("/acp/v1/messages/{msg_id}/status", axum::routing::get(message_status))
         .route("/acp/v1/peers", axum::routing::get(get_peers))
         .route("/acp/v1/messages/send", axum::routing::post(send_message))
         .route("/acp/v1/messages/pending", axum::routing::get(get_pending))

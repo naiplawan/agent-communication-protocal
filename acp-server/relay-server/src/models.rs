@@ -3,27 +3,30 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Absent optional fields are omitted rather than emitted as `null`: agents
+// deserialize `intent` and `priority` into non-optional enums, which accept a
+// missing key but reject an explicit null.
 pub struct Envelope {
     pub msg_id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corr_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<AgentAddr>,
     pub sender: AgentAddr,
     pub recipient: AgentAddr,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<ReplyTo>,
     #[serde(default = "default_intent")]
     pub intent: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hops: Option<Hops>,
 }
 
@@ -34,7 +37,7 @@ fn default_intent() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentAddr {
     pub agent_id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
 }
 
@@ -51,7 +54,61 @@ pub struct Hops {
     pub count: u32,
     pub max: u32,
     #[serde(default)]
-    pub trace: Vec<String>,
+    pub trace: Vec<HopTraceEntry>,
+}
+
+/// One entry in `hops.trace`.
+///
+/// The protocol specifies `{agent_id, machine_id, timestamp}`, which is what
+/// agents deserialize. Earlier relay builds wrote a bare `"agent_id@machine_id"`
+/// string, so reading accepts both forms and normalizes to the structured one —
+/// messages already persisted in the old shape stay readable.
+#[derive(Debug, Clone, Serialize)]
+pub struct HopTraceEntry {
+    pub agent_id: String,
+    pub machine_id: String,
+    pub timestamp: String,
+}
+
+impl HopTraceEntry {
+    pub fn now(agent_id: &str, machine_id: &str) -> Self {
+        Self {
+            agent_id: agent_id.to_string(),
+            machine_id: machine_id.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HopTraceEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Structured {
+                agent_id: String,
+                #[serde(default)]
+                machine_id: String,
+                #[serde(default)]
+                timestamp: String,
+            },
+            Legacy(String),
+        }
+
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Structured { agent_id, machine_id, timestamp } => {
+                Self { agent_id, machine_id, timestamp }
+            }
+            Raw::Legacy(s) => {
+                let (agent_id, machine_id) = s.split_once('@').unwrap_or((s.as_str(), ""));
+                Self {
+                    agent_id: agent_id.to_string(),
+                    machine_id: machine_id.to_string(),
+                    timestamp: String::new(),
+                }
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

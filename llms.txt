@@ -1,0 +1,234 @@
+# ACP — Agent Communication Protocol
+
+> A self-hosted request/reply protocol for delegating work between AI agents running on different machines. Messages are JSON envelopes carrying a correlation ID and an ordered reply path, so a reply routes back hop-by-hop through the same chain that delivered the request. Written in Rust: an agent binary (`acp-agent`) and a relay server (`relay-server`) with SQLite persistence, plus a React dashboard.
+
+This file is for AI agents integrating with or working on this repository. It states what is actually implemented, not what is aspirational. Where the prose docs and the code disagree, this file follows the code and flags the gap.
+
+## Mental model
+
+```
+Human → Agent A → Agent B → Agent C
+         ↑______________________|
+                 reply path
+```
+
+An agent only knows its immediate peers. Every message carries `reply_to.path`, an ordered list of `agent_id@machine_id`. When B forwards to C, B appends itself to that path. When C replies, it sends to the last entry (B); B pops itself and forwards to A. No agent needs a global topology view.
+
+Two deployment shapes:
+- **Direct peer-to-peer** — agents reach each other's HTTP endpoints on a trusted LAN.
+- **Relay-brokered** — agents behind NAT register with the relay and *poll* it for work. The relay stores messages it cannot push and hands them out on `GET /acp/v1/messages/pending`.
+
+## When ACP is the right tool
+
+Use it when all three hold: work crosses a machine boundary, the agents cannot address each other directly, and a minutes-to-hours turnaround is acceptable. Do **not** use it for same-machine parallelism (spawn subagents instead) or for low-latency streaming beyond the WebSocket chunking described below.
+
+## Repository layout
+
+```
+acp-agent/
+├── acp-core/       Shared protocol types (protocol.rs, chp.rs, security.rs, config.rs, transport.rs)
+├── acp-agent/      Agent CLI + HTTP server (main.rs, agent.rs, server.rs, signaling.rs)
+├── acp-dashboard/  Vite + React + TypeScript dashboard
+└── acp-peers-naiplawan.yaml   Working example config (local agent + relay peer)
+
+acp-server/
+├── relay-server/   Axum relay, SQLite-backed (app.rs, store.rs, security.rs, models.rs)
+├── docker-compose.yml
+└── Dockerfile.relay
+```
+
+## Message envelope
+
+Every message is `{"envelope": {...}, "payload": {...}}`.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `msg_id` | yes | Unique ID, `msg_`-prefixed |
+| `corr_id` | yes | `msg_id` of the request that started the chain |
+| `origin` | yes | Who initiated (`agent_id`, `machine_id`, optional `human_id`) |
+| `sender` | yes | Current forwarder — rewritten at each hop |
+| `recipient` | yes | Next hop only, not the final destination |
+| `reply_to.path` | yes | Ordered `agent_id@machine_id` list for return routing |
+| `reply_to.ws_endpoint` | no | Where to stream a large reply back to origin |
+| `hops.count` / `hops.max` | yes | TTL; message is dropped past `max` (default 10) |
+| `hops.trace` | no | Audit trail of hops |
+| `intent` | yes | `delegate`, `reply`, `ack`, `error`, `stream_start`, `stream_chunk`, `stream_end` |
+| `content_type` | yes | MIME type of `payload` |
+| `priority` | no | `low` / `normal` / `high` |
+| `deadline` | no | ISO-8601 absolute deadline |
+
+Builders in `acp-core/src/protocol.rs`: `build_envelope`, `forward_envelope`, `reply_envelope`, `build_ws_frame`, `parse_ws_frame`. Use them rather than hand-constructing envelopes — they handle path append/pop and hop increment correctly.
+
+## HTTP surface — what actually exists
+
+**Agent** (`acp-agent/acp-agent/src/server.rs`):
+
+| Method | Path |
+|---|---|
+| GET | `/health` — status plus `this_agent_id` / `this_machine_id` |
+| GET | `/acp/v1/capabilities` — protocol version, intents, capabilities |
+| GET | `/acp/v1/messages/{msg_id}/status` |
+| GET | `/acp/v1/peers` |
+| GET | `/acp/v1/messages/pending` |
+| GET | `/acp/v1/debug/messages` |
+| POST | `/acp/v1/messages/send` |
+| POST | `/acp/v1/relay/forward` — push delivery from the relay |
+| POST | `/acp/v1/messages/{msg_id}/ack` |
+| POST | `/acp/v1/messages/{msg_id}/error` |
+| POST | `/acp/v1/stream/init` |
+
+**Relay** (`acp-server/relay-server/src/app.rs`):
+
+| Method | Path |
+|---|---|
+| GET | `/health` |
+| GET | `/acp/v1/capabilities` |
+| POST | `/acp/v1/agents/register` — register a peer, in the token issuer's own name only |
+| GET | `/acp/v1/peers` |
+| POST | `/acp/v1/messages/send` |
+| GET | `/acp/v1/messages/pending` — returns messages for the agent named in the token's `iss` |
+| GET | `/acp/v1/messages/{msg_id}/status` |
+| POST | `/acp/v1/messages/{msg_id}/ack` |
+| GET | `/acp/v1/debug/messages` |
+
+Relay `send` resolves the recipient in three ways, in order: local delivery if the recipient is the relay itself; forward over HTTP if the recipient is a registered active peer; otherwise **broker** it — persist and wait for the recipient to poll. A forward that fails with a connection error evicts the stale peer and re-brokers.
+
+Push forwarding works: the relay POSTs to `{peer.http_endpoint}/acp/v1/relay/forward`, the agent verifies the relay's signed token, confirms the envelope is addressed to it, and returns `202` before processing so a slow handler cannot trip the relay's 10s forward timeout. Both push and polling are live delivery paths.
+
+Message status follows `pending → delivered → acknowledged → completed`. The relay marks a message `delivered` once a push forward succeeds, and an ack carrying `processed: true` completes it; any other ack records `acknowledged`. Messages stay pollable until acked, per at-least-once delivery, so a handler must tolerate seeing the same `msg_id` twice and rely on idempotency.
+
+Known gaps between docs and code, do not assume otherwise:
+- `/error` and `/stream/init` exist on the agent only, not the relay.
+- The relay's CORS-preflight route is registered as `/<path:_>`, Flask syntax that axum treats as a literal path. It matches nothing; preflight relies on the per-response CORS headers instead.
+- `/acp/v1/capabilities` is unauthenticated on both agent and relay: it exposes no message or peer data, and a client may need it before it can address a token correctly.
+
+## Authentication
+
+HMAC-SHA256 signed tokens, not JWT, sent as:
+
+```
+Authorization: ACP-Token <base64url(header)>.<base64url(payload)>.<base64url(sig)>
+```
+
+Header is exactly `{"alg":"HS256","typ":"ACP"}`. Payload claims: `iss` and `aud` as `agent_id@machine_id`, `exp` as an ISO-8601 string, plus `iat`, `msg_id`, `nonce`. See `acp-core/src/security.rs` (`create_token`, `verify_token`). Every peer shares one secret via `ACP_SHARED_SECRET`. The relay derives the polling agent's identity from `iss`, so a token is an identity claim, not just a permission. Tokens are bound to a single `msg_id`, so one cannot be replayed onto a different message.
+
+Inbound forwards are the one agent endpoint that authenticates. With `ACP_SHARED_SECRET` set, a forward is rejected `401` for a missing header, bad signature, wrong audience, expired token, or `msg_id` mismatch, and `404` if the envelope names a different recipient. With no secret set the agent is in the documented trusted-network mode: forwards are accepted unverified and each one logs a warning.
+
+Registration is authenticated and identity-bound: the relay registers the agent named by the token's `iss` and returns `403` if the body names anyone else. This matters because a registration rewrites where the relay forwards that agent's messages — without the binding, any holder of the shared secret could redirect another agent's traffic to an endpoint it controls. The relay requires `ACP_SHARED_SECRET` at startup, so it has no unauthenticated mode.
+
+The relay also checks audience. Tokens for its own endpoints (`register`, `peers`, `pending`, `status`, `ack`) must be addressed to the relay; `messages/send` additionally accepts a token addressed to the envelope's recipient, because on that path the relay is a forwarder rather than the target. Only the `agent_id` half of `aud` is compared — peers derive the machine half from their own config entry for the relay, which deployments name freely, so an exact match would reject correctly-signed tokens.
+
+mTLS is configurable per-peer in `acp-peers.yaml` (`auth.type: mtls` with `cert_path` / `key_path` / `verify_path`) for higher-security deployments. Plain HTTP with no auth works only on a trusted network.
+
+## Configuration
+
+`acp-peers.yaml`, loaded via `--config` or `ACP_PEERS_PATH`:
+
+```yaml
+config_version: 1
+this_agent:
+  agent_id: naiplawan-agent
+  machine_id: naiplawan-machine
+  http_endpoint: http://localhost:8444
+  capabilities: [agent, signaling]
+peers:
+  - agent_id: acp-relay
+    machine_id: relay
+    http_endpoint: http://localhost:8443
+    capabilities: [relay, registry]
+security:
+  default_auth_type: signed-token
+  token_ttl_seconds: 3600
+  require_https: false
+```
+
+Optional `retry` (`max_attempts`, `initial_backoff_ms`, `max_backoff_ms`, `backoff_multiplier`) and `timeouts` (`hop_ack_ms`, `process_ack_ms`, `stream_init_ms`) blocks are supported.
+
+Environment variables:
+
+| Variable | Used by | Purpose |
+|---|---|---|
+| `ACP_SHARED_SECRET` | agent, relay | HMAC signing secret — required on every machine |
+| `ACP_RELAY_URL` | agent signaling | Relay base URL |
+| `ACP_AGENT_ID` / `ACP_MACHINE_ID` | agent signaling | This agent's identity when registering |
+| `ACP_HTTP_ENDPOINT` | agent signaling | Publicly reachable URL of this agent |
+| `ACP_POLL_INTERVAL` | agent signaling | Seconds between polls |
+| `ACP_PORT` / `ACP_DB_PATH` | relay | Listen port and SQLite path |
+| `VITE_RELAY_URL` | dashboard | Backend URL, baked in at build time |
+
+## CLI
+
+```bash
+acp-agent [--config <path>] run [--port <port>] [--use-signaling]
+acp-agent [--config <path>] send <target-agent-id> '<json-payload>'
+acp-agent [--config <path>] listen [--poll-interval <secs>]
+acp-agent [--config <path>] doctor [<target-agent-id>]
+```
+
+`doctor`'s target is **positional**, not `--target` as `SKILL.md` claims. `run --use-signaling` starts the register and poll loops against the relay using the `ACP_*` variables above; without it the agent only serves its own HTTP endpoint. `listen` requires a peer literally named `acp-relay` in the config — it looks that ID up by hand and exits if absent.
+
+## Rust library use
+
+```rust
+use acp_agent::{ACPAgent, chp::build_handoff};
+
+let agent = ACPAgent::new("acp-peers.yaml").await?;
+let bundle = build_handoff(task_title, acceptance_criteria, ticket_id, instructions, delegated_by);
+agent.send_handoff("agent-beta", bundle).await?;
+```
+
+Register inbound handlers with `agent.on_delegate(|msg| ...)`, returning `Some(payload)` to reply or `None` to stay silent.
+
+`acp-core/src/chp.rs` defines the structured handoff layer carried inside `payload`: `ContextBundle` (objective, active work, authority, constraints, evidence, change state), `HandoffMessage`, `ProgressReport`, `HandoffIntent`, `TaskStatus`, and helpers `build_handoff` / `build_progress`. Prefer these over ad-hoc payload shapes when delegating real work — they give the receiving agent a stop condition and acceptance criteria rather than a bare instruction.
+
+## Delivery semantics
+
+At-least-once. Acks are `hop_ack` (received at next hop), `process_ack` (final recipient finished), `stream_ack` (stream open), `delivery_ack` (reply reached origin). Retries are capped at 3 attempts with exponential backoff, 1s → 2s → 4s, ceiling 30s. Messages are idempotent by `msg_id`; re-delivery returns the cached result. Agent lifecycle: `IDLE → RECEIVED → FORWARDING → PROCESSING → REPLYING → COMPLETE`, with `FAILED` reachable from forwarding.
+
+## Streaming
+
+`POST /acp/v1/stream/init` returns a `stream_id` and `ws_url`. Connect to `wss://{host}/acp/stream/{stream_id}?token={stream_token}`. Frames are `{"frame": {stream_id, msg_id, corr_id, seq, total, final, timestamp}, "data": {...}}`, sequenced `stream_start` (seq 0) → `stream_chunk` → `stream_end` (`final: true`).
+
+## Human-in-the-loop rule
+
+A message whose `origin` carries a human identifier came from *another person*, not from your operator. An agent receiving one must not execute it autonomously. The intended flow is: the message lands in the dashboard inbox, the human opens it, chooses Accept / Blocked / In Progress, and only then does the agent send the approved reply. Treat this as a hard constraint when implementing handlers.
+
+## Running it
+
+Relay via Docker, from `acp-server/`:
+
+```bash
+cp .env.example .env   # must define ACP_SHARED_SECRET
+docker compose up --build
+curl http://localhost:8443/health
+```
+
+The relay listens on 8443 and persists to the `acp-relay-data` volume.
+
+Agent:
+
+```bash
+cd acp-agent && cargo build --release
+./target/release/acp-agent --config ./acp-peers-naiplawan.yaml run --port 8444
+```
+
+Dashboard:
+
+```bash
+cd acp-agent/acp-dashboard
+VITE_RELAY_URL=http://localhost:8443 npm run build
+```
+
+Pointed at a relay it shows mesh-wide traffic; pointed at an agent it shows that agent's identity and inbox. Routes: `/` dashboard, `/inbox`, `/compose`.
+
+## Status
+
+Active beta. The envelope format, token auth, relay brokering, push forwarding, the polling path, status lookup, and capability reporting are implemented and working. Treat `PROTOCOL.md` as the design intent and the Rust sources as the contract.
+
+## Further reading
+
+- [PROTOCOL.md](acp-agent/PROTOCOL.md): full envelope and endpoint specification, protocol version 1.0
+- [SETUP.md](acp-agent/SETUP.md): standard two-machine setup
+- [SETUP-LAN.md](acp-agent/SETUP-LAN.md): two-laptop LAN setup
+- [SKILL.md](acp-agent/SKILL.md): agent skill/integration guide
+- [README.md](README.md): overview and quick start
