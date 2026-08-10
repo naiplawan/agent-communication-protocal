@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { BrowserRouter, Link, Route, Routes, useLocation } from 'react-router-dom';
 import {
+  Activity,
   AlertCircle,
   ArrowRight,
+  Bell,
+  BellOff,
   Check,
   ChevronRight,
   Circle,
@@ -21,6 +24,8 @@ import {
   SlidersHorizontal,
   Volume2,
   VolumeX,
+  Wifi,
+  WifiOff,
   X,
   Zap,
 } from 'lucide-react';
@@ -35,16 +40,106 @@ import {
   transformToAgentHealth,
   transformToDispatch,
 } from './api';
-import type { AgentHealth, CommandCenterMetrics, Dispatch, Peer } from './types';
+import type { AgentHealth, CommandCenterMetrics, Dispatch, Peer, PendingMessage } from './types';
 import { Button } from './components/ui/button';
 
 const POLL_INTERVAL = 10_000;
+const WS_RECONNECT_DELAY = 3000;
 
 type RelayStatus = { status: string; agent: string; this_agent_id?: string; this_machine_id?: string };
 
+// ─── WebSocket Manager ────────────────────────────────────────────────────────
+// NOTE: The current relay does not implement a live WebSocket endpoint.
+// This hook gracefully falls back to polling mode when WebSocket is unavailable.
+
+type WsMessage = {
+  type: 'message' | 'ack' | 'error' | 'presence';
+  data: unknown;
+};
+
+function useWebSocket(onMessage: (msg: WsMessage) => void) {
+  const [connected, setConnected] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const url = useMemo(() => {
+    const base = (import.meta.env.VITE_RELAY_URL || '/api/relay')
+      .replace(/^http/, 'ws')
+      .replace(/\/acp\/v1.*$/, '');
+    return `${base}/acp/stream/live`;
+  }, []);
+
+  const connect = () => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    try {
+      const ws = new WebSocket(url);
+      const timeout = setTimeout(() => {
+        if (ws.readyState !== WebSocket.OPEN) {
+          ws.close();
+          setConnected(false);
+          // No relay WS endpoint — stay in polling mode
+        }
+      }, 3000);
+      ws.onopen = () => {
+        clearTimeout(timeout);
+        setConnected(true);
+      };
+      ws.onclose = () => {
+        clearTimeout(timeout);
+        setConnected(false);
+        reconnectTimer.current = setTimeout(connect, WS_RECONNECT_DELAY);
+      };
+      ws.onerror = () => {
+        clearTimeout(timeout);
+        ws.close();
+        setConnected(false);
+      };
+      ws.onmessage = (e) => {
+        try {
+          const parsed = JSON.parse(e.data) as WsMessage;
+          onMessage(parsed);
+        } catch { /* ignore parse errors */ }
+      };
+      wsRef.current = ws;
+    } catch {
+      setConnected(false);
+    }
+  };
+
+  const disconnect = () => {
+    if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+    wsRef.current?.close();
+  };
+
+  useEffect(() => {
+    connect();
+    return disconnect;
+  }, [url]);
+
+  return { connected };
+}
+
+// ─── Desktop Notifications ─────────────────────────────────────────────────────
+
+function useNotifications(enabled: boolean) {
+  const requestPermission = () => {
+    if (Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  };
+
+  const notify = (title: string, body: string, icon?: string) => {
+    if (!enabled || Notification.permission !== 'granted') return;
+    try {
+      new Notification(title, { body, icon: icon ?? '/acp-icon.svg', silent: true });
+    } catch { /* quotas or blocked */ }
+  };
+
+  return { notify, requestPermission };
+}
+
 // ─── Data Hook ────────────────────────────────────────────────────────────────
 
-function useData() {
+function useData(opts: { onNewMessage?: (d: Dispatch) => void } = {}) {
   const [dispatches, setDispatches] = useState<Dispatch[]>([]);
   const [agents, setAgents] = useState<AgentHealth[]>([]);
   const [metrics, setMetrics] = useState<CommandCenterMetrics | null>(null);
@@ -98,13 +193,50 @@ function useData() {
     }
   };
 
+  // WebSocket real-time updates
+  const handleWsMessage = (msg: WsMessage) => {
+    if (msg.type === 'message' && msg.data && typeof msg.data === 'object') {
+      const pm = msg.data as PendingMessage;
+      if (pm.msg_id) {
+        const dispatch = transformToDispatch(pm);
+        setDispatches((prev) => {
+          // Avoid duplicates, prepend new messages
+          if (prev.some((d) => d.dispatch_id === dispatch.dispatch_id)) return prev;
+          return [dispatch, ...prev];
+        });
+        setMetrics((prev) =>
+          prev
+            ? { ...prev, pending_handoffs: prev.pending_handoffs + 1 }
+            : prev
+        );
+        opts.onNewMessage?.(dispatch);
+      }
+    }
+    // Presence updates trigger a full reload
+    if (msg.type === 'presence') {
+      void load();
+    }
+  };
+
+  const { connected } = useWebSocket(handleWsMessage);
+
   useEffect(() => {
     void load();
     const interval = setInterval(() => void load(), POLL_INTERVAL);
     return () => clearInterval(interval);
   }, []);
 
-  return { dispatches, agents, metrics, relay, error, loading, lastUpdated, load };
+  return {
+    dispatches,
+    agents,
+    metrics,
+    relay,
+    error,
+    loading,
+    lastUpdated,
+    load,
+    wsConnected: connected,
+  };
 }
 
 // ─── Shared UI Primitives ────────────────────────────────────────────────────
@@ -148,7 +280,23 @@ function AgentAvatar({ agentId, status }: { agentId: string; status: string }) {
 
 // ─── Shell & Navigation ───────────────────────────────────────────────────────
 
-function Shell({ relay, soundEnabled, onToggleSound, children }: { relay: RelayStatus; soundEnabled: boolean; onToggleSound: () => void; children: React.ReactNode }) {
+function Shell({
+  relay,
+  soundEnabled,
+  notificationsEnabled,
+  onToggleSound,
+  onToggleNotifications,
+  wsConnected,
+  children,
+}: {
+  relay: RelayStatus;
+  soundEnabled: boolean;
+  notificationsEnabled: boolean;
+  onToggleSound: () => void;
+  onToggleNotifications: () => void;
+  wsConnected: boolean;
+  children: React.ReactNode;
+}) {
   const location = useLocation();
   const online = relay.status === 'ok';
   const isAgent = !!relay.this_agent_id;
@@ -171,6 +319,11 @@ function Shell({ relay, soundEnabled, onToggleSound, children }: { relay: RelayS
           <span className="brand-sub">Control Plane</span>
         </Link>
         <div className="topbar-right">
+          {/* Connection status */}
+          <div className={`connection-pill ${wsConnected ? 'connection-pill--live' : 'connection-pill--offline'}`}>
+            {wsConnected ? <Wifi size={12} /> : <WifiOff size={12} />}
+            <span>{wsConnected ? 'Live' : 'Reconnecting…'}</span>
+          </div>
           <div className="relay-pill">
             <StatusDot status={online ? 'online' : 'offline'} />
             <span>{online
@@ -182,6 +335,10 @@ function Shell({ relay, soundEnabled, onToggleSound, children }: { relay: RelayS
           <Button variant="icon" className="icon-btn sound-btn" title={soundEnabled ? 'Mute message notifications' : 'Enable message notifications'} onClick={onToggleSound}>
             {soundEnabled ? <Volume2 size={15} /> : <VolumeX size={15} />}
              <span>{soundEnabled ? 'Sound on' : 'Sound off'}</span>
+           </Button>
+           <Button variant="icon" className="icon-btn" title={notificationsEnabled ? 'Disable desktop notifications' : 'Enable desktop notifications'} onClick={onToggleNotifications}>
+            {notificationsEnabled ? <Bell size={15} /> : <BellOff size={15} />}
+             <span>{notificationsEnabled ? 'Notify on' : 'Notify off'}</span>
            </Button>
            <Button variant="icon" className="icon-btn" title="Refresh data">
              <RefreshCw size={15} />
@@ -210,7 +367,9 @@ function Shell({ relay, soundEnabled, onToggleSound, children }: { relay: RelayS
               <small>{online ? `${isAgent ? 'Agent' : 'Relay'} · v1.0` : 'Disconnected'}</small>
             </div>
           </div>
-          <p className="sidebar-note">Auto-refreshes every 10s · Click any metric to explore</p>
+          <p className="sidebar-note">
+            {wsConnected ? 'Real-time updates active' : 'Polling every 10s'}
+          </p>
         </div>
       </aside>
       <main className="main-content">{children}</main>
@@ -272,7 +431,7 @@ function MetricCard({
 
 // ─── Dashboard / Command Center ───────────────────────────────────────────────
 
-function Dashboard({ data }: { data: ReturnType<typeof useData> }) {
+function Dashboard({ data, onAgentClick }: { data: ReturnType<typeof useData>; onAgentClick?: (a: AgentHealth) => void }) {
   const { metrics, agents, dispatches, relay, loading, error, load } = data;
   const recent = dispatches.slice(-8).reverse();
   const alertMetrics = metrics
@@ -369,7 +528,7 @@ function Dashboard({ data }: { data: ReturnType<typeof useData> }) {
                 </Link>
               </div>
               {agents.length ? (
-                <AgentFeed agents={agents} />
+                <AgentFeed agents={agents} onAgentClick={onAgentClick} />
               ) : (
                 <div className="empty-state">
                   <Server size={28} />
@@ -406,11 +565,18 @@ function MessageFeed({ dispatches, compact }: { dispatches: Dispatch[]; compact?
 
 // ─── Agent Feed ────────────────────────────────────────────────────────────────
 
-function AgentFeed({ agents }: { agents: AgentHealth[] }) {
+function AgentFeed({ agents, onAgentClick }: { agents: AgentHealth[]; onAgentClick?: (a: AgentHealth) => void }) {
   return (
     <div className="agent-feed">
       {agents.map((a) => (
-        <div key={a.peer.agent_id} className="agent-feed-row">
+        <div
+          key={a.peer.agent_id}
+          className="agent-feed-row agent-feed-row--clickable"
+          onClick={() => onAgentClick?.(a)}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onAgentClick?.(a); }}
+        >
           <AgentAvatar agentId={a.peer.agent_id} status={a.status} />
           <div className="agent-feed-info">
             <strong>{a.peer.agent_id}</strong>
@@ -642,7 +808,7 @@ function Inbox({ data }: { data: ReturnType<typeof useData> }) {
 
 // ─── Agents Page ─────────────────────────────────────────────────────────────
 
-function Agents({ data }: { data: ReturnType<typeof useData> }) {
+function Agents({ data, onAgentClick }: { data: ReturnType<typeof useData>; onAgentClick?: (a: AgentHealth) => void }) {
   const { agents, loading } = data;
   const online = agents.filter((a) => a.status === 'online');
   const offline = agents.filter((a) => a.status === 'offline');
@@ -675,7 +841,14 @@ function Agents({ data }: { data: ReturnType<typeof useData> }) {
       ) : (
         <div className="agents-grid">
           {agents.map((a) => (
-            <div key={a.peer.agent_id} className={`agent-card ${a.status === 'offline' ? 'agent-card--offline' : ''}`}>
+            <div
+              key={a.peer.agent_id}
+              className={`agent-card ${a.status === 'offline' ? 'agent-card--offline' : ''}`}
+              onClick={() => onAgentClick?.(a)}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onAgentClick?.(a); }}
+            >
               <div className="agent-card-header">
                 <AgentAvatar agentId={a.peer.agent_id} status={a.status} />
                 <div className="agent-card-info">
@@ -687,7 +860,7 @@ function Agents({ data }: { data: ReturnType<typeof useData> }) {
               <div className="agent-card-details">
                 <div className="agent-card-detail">
                   <Globe size={13} />
-                  <code>{a.peer.http_endpoint}</code>
+                  <code>{a.peer.http_endpoint || 'No endpoint'}</code>
                 </div>
                 {a.peer.capabilities && a.peer.capabilities.length > 0 && (
                   <div className="agent-card-capabilities">
@@ -928,6 +1101,119 @@ function Setup() {
   );
 }
 
+// ─── Agent Detail Modal ──────────────────────────────────────────────────────
+
+function AgentDetailModal({
+  agent,
+  onClose,
+  onMessage,
+}: {
+  agent: AgentHealth;
+  onClose: () => void;
+  onMessage: (agentId: string) => void;
+}) {
+  const isOnline = agent.status === 'online';
+  return (
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <section className="agent-detail-modal" role="dialog" aria-modal="true">
+        <div className="modal-header">
+          <div className="agent-detail-header">
+            <AgentAvatar agentId={agent.peer.agent_id} status={agent.status} />
+            <div>
+              <p className="eyebrow">Agent</p>
+              <h2 id="agent-title">{agent.peer.agent_id}</h2>
+            </div>
+            <StatusBadge value={agent.status} />
+          </div>
+          <button className="icon-btn icon-btn--ghost" onClick={onClose} aria-label="Close">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="agent-detail-body">
+          {/* Identity */}
+          <div className="detail-section">
+            <h3><Globe size={14} /> Identity</h3>
+            <div className="detail-grid">
+              <div className="detail-item">
+                <span className="detail-item-label">Agent ID</span>
+                <code>{agent.peer.agent_id}</code>
+              </div>
+              <div className="detail-item">
+                <span className="detail-item-label">Machine ID</span>
+                <code>{agent.peer.machine_id}</code>
+              </div>
+              {agent.peer.http_endpoint && (
+                <div className="detail-item detail-item--full">
+                  <span className="detail-item-label">HTTP Endpoint</span>
+                  <code>{agent.peer.http_endpoint}</code>
+                </div>
+              )}
+              {agent.peer.ws_endpoint && (
+                <div className="detail-item detail-item--full">
+                  <span className="detail-item-label">WebSocket Endpoint</span>
+                  <code>{agent.peer.ws_endpoint}</code>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Capabilities */}
+          {agent.peer.capabilities && agent.peer.capabilities.length > 0 && (
+            <div className="detail-section">
+              <h3><Zap size={14} /> Capabilities</h3>
+              <div className="capability-list">
+                {agent.peer.capabilities.map((cap) => (
+                  <span key={cap} className="capability-chip capability-chip--large">{cap}</span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Metrics */}
+          <div className="detail-section">
+            <h3><Activity size={14} /> Metrics</h3>
+            <div className="detail-grid">
+              <div className="detail-item">
+                <span className="detail-item-label">Queue Depth</span>
+                <span className="detail-item-value">{agent.queue_depth}</span>
+              </div>
+              <div className="detail-item">
+                <span className="detail-item-label">Retry Count</span>
+                <span className="detail-item-value">{agent.retry_count}</span>
+              </div>
+              <div className="detail-item">
+                <span className="detail-item-label">CDF Context</span>
+                <StatusBadge value={agent.cdf_context_freshness ?? 'unknown'} />
+              </div>
+              <div className="detail-item">
+                <span className="detail-item-label">Version Compatible</span>
+                <StatusBadge value={agent.version_compatible ? 'online' : 'offline'} />
+              </div>
+            </div>
+          </div>
+
+          {/* Actions */}
+          <div className="detail-section detail-section--actions">
+            <Button
+              variant="primary"
+              onClick={() => { onClose(); onMessage(agent.peer.agent_id); }}
+              disabled={!isOnline}
+            >
+              <Send size={14} />
+              {isOnline ? `Send message to ${agent.peer.agent_id}` : 'Agent is offline'}
+            </Button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 // ─── Compose Modal ────────────────────────────────────────────────────────────
 
 function ComposeModal({
@@ -1095,11 +1381,20 @@ function ComposeModal({
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 function App() {
-  const data = useData();
-  const [soundEnabled, setSoundEnabled] = useState(() => localStorage.getItem('acp-sound-enabled') === 'true');
+  const [notificationsEnabled, setNotificationsEnabled] = useState(
+    () => localStorage.getItem('acp-notifications-enabled') === 'true'
+  );
+  const [soundEnabled, setSoundEnabled] = useState(
+    () => localStorage.getItem('acp-sound-enabled') === 'true'
+  );
+  const [composeRecipient, setComposeRecipient] = useState<string | null>(null);
+  const [detailAgent, setDetailAgent] = useState<AgentHealth | null>(null);
   const audioContext = useRef<AudioContext | null>(null);
   const seenMessages = useRef<Set<string> | null>(null);
-  const playNotification = () => {
+
+  const { notify, requestPermission } = useNotifications(notificationsEnabled);
+
+  const playSound = () => {
     const context = audioContext.current || new AudioContext();
     audioContext.current = context;
     const now = context.currentTime;
@@ -1116,29 +1411,253 @@ function App() {
       oscillator.stop(now + index * 0.11 + 0.17);
     });
   };
+
+  const handleNewMessage = (dispatch: Dispatch) => {
+    if (soundEnabled) playSound();
+    if (notificationsEnabled) {
+      notify(
+        `New ${dispatch.intent} from ${dispatch.from.agent_id}`,
+        dispatch.payload_preview ?? `Message to ${dispatch.to.agent_id}`,
+      );
+    }
+  };
+
+  const data = useData({ onNewMessage: handleNewMessage });
+
   useEffect(() => {
     if (data.loading) return;
     const currentIds = new Set(data.dispatches.map((message) => message.dispatch_id));
-    if (seenMessages.current && soundEnabled && [...currentIds].some((id) => !seenMessages.current?.has(id))) playNotification();
+    if (seenMessages.current && soundEnabled && [...currentIds].some((id) => !seenMessages.current?.has(id))) {
+      playSound();
+    }
     seenMessages.current = currentIds;
   }, [data.dispatches, data.loading, soundEnabled]);
+
   const toggleSound = () => {
     const next = !soundEnabled;
     setSoundEnabled(next);
     localStorage.setItem('acp-sound-enabled', String(next));
-    if (next) playNotification();
+    if (next) playSound();
   };
+
+  const toggleNotifications = () => {
+    if (!notificationsEnabled) {
+      requestPermission();
+    }
+    const next = !notificationsEnabled;
+    setNotificationsEnabled(next);
+    localStorage.setItem('acp-notifications-enabled', String(next));
+  };
+
+  const openDetail = (agent: AgentHealth) => setDetailAgent(agent);
+  const closeDetail = () => setDetailAgent(null);
+  const openCompose = (agentId?: string) => {
+    setComposeRecipient(agentId ?? null);
+  };
+  const closeCompose = () => setComposeRecipient(null);
+
   return (
     <BrowserRouter>
-      <Shell relay={data.relay} soundEnabled={soundEnabled} onToggleSound={toggleSound}>
+      <Shell
+        relay={data.relay}
+        soundEnabled={soundEnabled}
+        notificationsEnabled={notificationsEnabled}
+        onToggleSound={toggleSound}
+        onToggleNotifications={toggleNotifications}
+        wsConnected={data.wsConnected}
+      >
         <Routes>
-          <Route path="/" element={<Dashboard data={data} />} />
+          <Route path="/" element={<Dashboard data={data} onAgentClick={openDetail} />} />
           <Route path="/inbox" element={<Inbox data={data} />} />
-          <Route path="/agents" element={<Agents data={data} />} />
+          <Route path="/agents" element={<Agents data={data} onAgentClick={openDetail} />} />
           <Route path="/setup" element={<Setup />} />
         </Routes>
       </Shell>
+
+      {/* Agent detail modal */}
+      {detailAgent && (
+        <AgentDetailModal
+          agent={detailAgent}
+          onClose={closeDetail}
+          onMessage={(agentId) => { closeDetail(); openCompose(agentId); }}
+        />
+      )}
+
+      {/* Compose modal (triggered from agent detail or inbox) */}
+      {composeRecipient !== null && (
+        <ComposeModalWrapper
+          initialRecipient={composeRecipient}
+          onClose={closeCompose}
+          onSent={() => { closeCompose(); void data.load(); }}
+          agents={data.agents}
+          thisAgentId={data.relay.this_agent_id || 'naiplawan-agent'}
+          thisMachineId={data.relay.this_machine_id || 'naiplawan-machine'}
+        />
+      )}
     </BrowserRouter>
+  );
+}
+
+// Wrapper to open compose with pre-filled recipient
+function ComposeModalWrapper({
+  initialRecipient,
+  onClose,
+  onSent,
+  agents,
+  thisAgentId,
+  thisMachineId,
+}: {
+  initialRecipient: string;
+  onClose: () => void;
+  onSent: () => void;
+  agents: AgentHealth[];
+  thisAgentId: string;
+  thisMachineId: string;
+}) {
+  const [recipient, setRecipient] = useState(initialRecipient);
+  const [message, setMessage] = useState('');
+  const [link, setLink] = useState('');
+  const [attachment, setAttachment] = useState<{ name: string; type: string; size: number; data: string } | null>(null);
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const selectFile = (file: File | undefined) => {
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) {
+      setError('Files must be 5 MB or smaller.');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () =>
+      setAttachment({ name: file.name, type: file.type || 'application/octet-stream', size: file.size, data: String(reader.result) });
+    reader.readAsDataURL(file);
+  };
+
+  const submit = async () => {
+    if (!recipient.trim() || (!message.trim() && !link.trim() && !attachment)) {
+      setError('Add a recipient and at least a message, link, or file.');
+      return;
+    }
+    setSending(true);
+    setError(null);
+    const msgId = `msg_${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`;
+    const sender = { agent_id: thisAgentId, machine_id: thisMachineId };
+    const envelope = {
+      msg_id: msgId,
+      corr_id: msgId,
+      origin: sender,
+      sender,
+      recipient: { agent_id: recipient.trim(), machine_id: thisMachineId },
+      reply_to: [`${thisAgentId}@${thisMachineId}`],
+      hops: { count: 0, max: 10, trace: [] },
+      intent: 'delegate',
+      content_type: 'application/json',
+      priority: 'normal',
+      deadline: null,
+    };
+    try {
+      await sendMessage(envelope, {
+        message: message.trim() || undefined,
+        link: link.trim() || undefined,
+        attachment: attachment
+          ? { name: attachment.name, type: attachment.type, size: attachment.size, data: attachment.data }
+          : undefined,
+      });
+      onSent();
+    } catch (value) {
+      setError(value instanceof Error ? value.message : 'Unable to send message');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <section className="compose-modal" role="dialog" aria-modal="true" aria-labelledby="compose-title">
+        <div className="modal-header">
+          <div>
+            <p className="eyebrow">New message</p>
+            <h2 id="compose-title">Send to an agent</h2>
+          </div>
+           <button className="icon-btn icon-btn--ghost" onClick={onClose} aria-label="Close">
+             <X size={18} />
+           </button>
+        </div>
+
+        {agents.length > 0 && (
+          <div className="compose-recipients">
+            <p className="eyebrow">Known agents</p>
+            <div className="recipient-chips">
+              {agents.map((a) => (
+                <button
+                  key={a.peer.agent_id}
+                  className={`recipient-chip ${a.status === 'offline' ? 'recipient-chip--offline' : ''}`}
+                  onClick={() => setRecipient(a.peer.agent_id)}
+                >
+                  <Circle size={8} fill={a.status === 'online' ? 'var(--teal)' : 'var(--slate)'} />
+                  {a.peer.agent_id}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="compose-form">
+          <label className="form-label form-label--full">
+            Recipient
+            <input
+              className="form-input"
+              value={recipient}
+              onChange={(e) => setRecipient(e.target.value)}
+              placeholder="agent-id"
+            />
+          </label>
+          <label className="form-label form-label--full">
+            Message
+            <textarea
+              className="form-input form-textarea"
+              value={message}
+              onChange={(e) => setMessage(e.target.value)}
+              placeholder="What should the agent do?"
+              rows={5}
+            />
+          </label>
+          <label className="form-label form-label--full">
+            Link <span className="form-hint">optional</span>
+            <input
+              className="form-input"
+              value={link}
+              onChange={(e) => setLink(e.target.value)}
+              placeholder="https://example.com/context"
+              type="url"
+            />
+          </label>
+          <label className="form-label form-label--full">
+            File <span className="form-hint">optional · max 5 MB</span>
+            <input type="file" className="form-input form-input--file" onChange={(e) => selectFile(e.target.files?.[0])} />
+            {attachment && (
+              <small className="file-attached">
+                <Hash size={12} /> {attachment.name} · {(attachment.size / 1024).toFixed(0)} KB
+              </small>
+            )}
+          </label>
+        </div>
+
+        {error && <div className="compose-error">{error}</div>}
+
+        <div className="compose-footer">
+          <button className="btn btn--ghost" onClick={onClose}>Cancel</button>
+           <Button variant="primary" onClick={() => void submit()} disabled={sending}>
+             <Send size={14} />
+             {sending ? 'Sending…' : 'Send message'}
+          </Button>
+        </div>
+      </section>
+    </div>
   );
 }
 

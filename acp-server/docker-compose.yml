@@ -28,50 +28,5 @@ services:
       retries: 3
     restart: unless-stopped
 
-  naiplawan-agent:
-    build:
-      context: ../acp-agent
-      dockerfile: Dockerfile
-    container_name: naiplawan-agent
-    hostname: naiplawan-agent
-    env_file:
-      - path: .env
-        required: true
-      - path: .env.local
-        required: false
-    environment:
-      - ACP_RELAY_URL=http://relay:8443
-      - ACP_AGENT_ID=naiplawan-agent
-      - ACP_MACHINE_ID=naiplawan-machine
-      - ACP_HTTP_ENDPOINT=http://naiplawan-agent:8444
-      - ACP_SHARED_SECRET=${ACP_SHARED_SECRET}
-      - ACP_POLL_INTERVAL=3
-      - OPENROUTER_MODEL=deepseek/deepseek-v4-flash-0731
-    depends_on:
-      relay:
-        condition: service_healthy
-    restart: unless-stopped
-
-  dashboard:
-    build:
-      context: ../acp-agent/acp-dashboard
-      dockerfile: Dockerfile
-    container_name: acp-dashboard
-    hostname: dashboard
-    ports:
-      - "3000:3000"
-    environment:
-      - ACP_RELAY_URL=http://relay:8443
-      - ACP_SHARED_SECRET=${ACP_SHARED_SECRET}
-    depends_on:
-      relay:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:3000').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
 volumes:
   acp-relay-data:
