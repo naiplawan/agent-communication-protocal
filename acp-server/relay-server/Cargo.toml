@@ -3,9 +3,21 @@ name = "acp-relay"
 version = "0.1.0"
 edition = "2021"
 
+[lints.rust]
+future-incompatible = { level = "warn", priority = -2 }
+nonstandard_style = { level = "deny", priority = -3 }
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+redundant_clone = "deny"
+manual_while_let_some = "deny"
+pedantic = { level = "warn", priority = -1 }
+
 [dependencies]
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
 rusqlite = { version = "0.33", features = ["bundled"] }
 hmac = "0.12"
 sha2 = "0.10"
@@ -19,3 +31,5 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+parking_lot = "0.12"
+anyhow = "1"

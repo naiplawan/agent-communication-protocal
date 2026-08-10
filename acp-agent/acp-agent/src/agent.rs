@@ -1,42 +1,59 @@
-//! ACP Agent — base agent class with send/receive/delegate, reply routing, and streaming
+//! ACP Agent — send/receive/delegate, reply routing, and streaming
 //!
 //! Includes ACP-CHP: Context Handoff Protocol support.
 
-use acp_core::config::{load_config, resolve_this_agent, ACPConfig, ThisAgent, Peer};
-use acp_core::protocol::{
-    self, build_envelope, forward_envelope, reply_envelope, new_msg_id, new_corr_id,
-    new_stream_id, Envelope, Message, Origin, Intent, Priority, HopsExceededError,
-    ReplyPathEmptyError, StreamFrame, build_ws_frame,
-};
-use acp_core::security::PeerAuth;
-use acp_core::transport::ACPHttpClient;
-use acp_core::chp::{
-    ContextBundle, HandoffMessage, HandoffIntent, TaskStatus,
-    build_handoff, build_progress,
-};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use acp_core::chp::{ContextBundle, HandoffIntent, HandoffMessage};
+use acp_core::config::{load_config, resolve_this_agent, ACPConfig, Peer, ThisAgent};
+use acp_core::protocol::{
+    build_envelope, forward_envelope, new_corr_id, new_msg_id, new_stream_id, reply_envelope,
+    Intent, Message, NewEnvelope, Origin, Priority, DEFAULT_MAX_HOPS,
+};
+use acp_core::transport::ACPHttpClient;
+use serde_json::Value;
 use tokio::sync::RwLock;
+
+use crate::error::AgentError;
 
 // ---------------------------------------------------------------------------
 // State machine
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where an agent is in handling the message it is currently working on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentState {
+    /// Nothing in flight.
+    #[default]
     Idle,
+    /// A message has arrived but has not been dispatched.
     Received,
+    /// A message is being passed to another agent.
     Forwarding,
+    /// A handler is running.
     Processing,
+    /// An answer is being sent back along the reply path.
     Replying,
+    /// The message was handled through to its reply.
     Complete,
+    /// The message could not be handled or its reply could not be delivered.
     Failed,
 }
 
-impl Default for AgentState {
-    fn default() -> Self {
-        Self::Idle
+impl AgentState {
+    /// Wire representation of this state.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AgentState::Idle => "idle",
+            AgentState::Received => "received",
+            AgentState::Forwarding => "forwarding",
+            AgentState::Processing => "processing",
+            AgentState::Replying => "replying",
+            AgentState::Complete => "complete",
+            AgentState::Failed => "failed",
+        }
     }
 }
 
@@ -44,27 +61,43 @@ impl Default for AgentState {
 // Pending message tracking
 // ---------------------------------------------------------------------------
 
+/// One received message, retained for the dashboard.
 #[derive(Debug, Clone)]
 pub struct InboxEntry {
+    /// Message ID.
     pub msg_id: String,
+    /// Correlation ID of the exchange.
     pub corr_id: String,
+    /// Sending agent.
     pub sender_agent: String,
+    /// Machine the sender ran on.
     pub sender_machine: String,
+    /// Receiving agent.
     pub recipient_agent: String,
+    /// Machine the recipient ran on.
     pub recipient_machine: String,
+    /// Wire form of the message intent.
     pub intent: String,
+    /// Application data, when the message carried any.
     pub payload: Option<Value>,
+    /// Where the message stands.
     pub status: String,
+    /// Failure description, empty when there was none.
     pub error: String,
+    /// Unix seconds when the message arrived.
     pub received_at: f64,
 }
 
+/// One message this agent is still working on.
 #[derive(Debug, Clone)]
 pub struct PendingMessage {
+    /// The message itself.
     pub message: Message,
+    /// Where handling stands.
     pub state: AgentState,
-    pub retry_count: u32,
+    /// Unix seconds when tracking began.
     pub created_at: f64,
+    /// Stream opened to answer it, when one was.
     pub stream_id: Option<String>,
 }
 
@@ -72,38 +105,53 @@ pub struct PendingMessage {
 // Message handler type
 // ---------------------------------------------------------------------------
 
+/// A registered handler. Returning `Some` triggers an auto-reply.
 pub type MessageHandler = Arc<dyn Fn(Message) -> HandlerResult + Send + Sync>;
 
+/// What a handler produces: an optional reply payload.
 pub type HandlerResult = Option<Value>;
 
 // ---------------------------------------------------------------------------
 // ACPAgent
 // ---------------------------------------------------------------------------
 
+/// An ACP participant: routing config, an HTTP client, and registered handlers.
+///
+/// Cloning is not supported; share one behind an [`Arc`] instead. Every field is
+/// individually locked, so handlers may run concurrently.
 pub struct ACPAgent {
+    /// Peer config this agent routes with.
     pub config: Arc<ACPConfig>,
+    /// This agent's own identity and endpoints.
     pub this: ThisAgent,
+    /// Signed HTTP client used for every outbound message.
     pub client: Arc<ACPHttpClient>,
     handlers: Arc<RwLock<HashMap<String, MessageHandler>>>,
     handoff_handlers: Arc<RwLock<HashMap<String, MessageHandler>>>,
     pending: Arc<RwLock<HashMap<String, PendingMessage>>>,
     inbox: Arc<RwLock<Vec<InboxEntry>>>,
     state: Arc<RwLock<AgentState>>,
-    running: Arc<RwLock<bool>>,
 }
 
 impl ACPAgent {
     // ---- Construction ----
 
-    /// Load config from file, environment, or default locations
-    pub async fn from_config_file(config_path: Option<&str>) -> anyhow::Result<Self> {
-        let config = load_config(config_path).map_err(|e| anyhow::anyhow!("{}", e))?;
-        Self::from_config(config).await
+    /// Load config from `config_path`, the environment, or the default locations.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::Config`] when no config resolves or `this_agent` is
+    /// incomplete.
+    pub fn from_config_file(config_path: Option<&str>) -> Result<Self, AgentError> {
+        Self::from_config(load_config(config_path)?)
     }
 
-    /// Construct from a pre-loaded config
-    pub async fn from_config(config: ACPConfig) -> anyhow::Result<Self> {
-        let this = resolve_this_agent(&config).map_err(|e| anyhow::anyhow!("{}", e))?;
+    /// Construct from a pre-loaded config.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::Config`] when `this_agent` is missing or has no
+    /// `http_endpoint`.
+    pub fn from_config(config: ACPConfig) -> Result<Self, AgentError> {
+        let this = resolve_this_agent(&config)?;
 
         let client = ACPHttpClient::new(
             config.clone(),
@@ -120,293 +168,285 @@ impl ACPAgent {
             pending: Arc::new(RwLock::new(HashMap::new())),
             inbox: Arc::new(RwLock::new(Vec::new())),
             state: Arc::new(RwLock::new(AgentState::Idle)),
-            running: Arc::new(RwLock::new(false)),
         })
+    }
+
+    /// This agent's address as `agent_id@machine_id`.
+    fn addr(&self) -> String {
+        format!("{}@{}", self.this.agent_id, self.machine_id())
+    }
+
+    fn machine_id(&self) -> &str {
+        self.this.machine_id.as_deref().unwrap_or_default()
     }
 
     // ---- Handler registration ----
 
-    /// Register a handler for DELEGATE intent messages
+    /// Register a handler for [`Intent::Delegate`] messages.
     pub async fn on_delegate<F>(&self, f: F)
     where
         F: Fn(Message) -> HandlerResult + Send + Sync + 'static,
     {
-        let handler: MessageHandler = Arc::new(move |msg| f(msg));
-        let intent_str = Intent::Delegate.as_str().to_string();
-        let mut h = self.handlers.write().await;
-        h.insert(intent_str, handler);
+        self.register(Intent::Delegate.as_str(), Arc::new(f)).await;
     }
 
-    /// Register a handler for REPLY intent messages
+    /// Register a handler for [`Intent::Reply`] messages.
     pub async fn on_reply<F>(&self, f: F)
     where
         F: Fn(Message) -> HandlerResult + Send + Sync + 'static,
     {
-        let handler: MessageHandler = Arc::new(move |msg| f(msg));
-        let intent_str = Intent::Reply.as_str().to_string();
-        let mut h = self.handlers.write().await;
-        h.insert(intent_str, handler);
+        self.register(Intent::Reply.as_str(), Arc::new(f)).await;
     }
 
-    /// Register a handler for ERROR intent messages
+    /// Register a handler for [`Intent::Error`] messages.
     pub async fn on_error<F>(&self, f: F)
     where
         F: Fn(Message) -> HandlerResult + Send + Sync + 'static,
     {
-        let handler: MessageHandler = Arc::new(move |msg| f(msg));
-        let intent_str = Intent::Error.as_str().to_string();
-        let mut h = self.handlers.write().await;
-        h.insert(intent_str, handler);
+        self.register(Intent::Error.as_str(), Arc::new(f)).await;
     }
 
-    /// Register a handler for CHP HANDOFF messages
-    pub fn on_handoff<F>(&self, f: F)
+    async fn register(&self, intent: &str, handler: MessageHandler) {
+        self.handlers
+            .write()
+            .await
+            .insert(intent.to_string(), handler);
+    }
+
+    /// Register a handler for CHP handoff messages.
+    ///
+    /// The handler is skipped for a message whose payload carries no readable
+    /// [`ContextBundle`].
+    pub async fn on_handoff<F>(&self, f: F)
+    where
+        F: Fn(ContextBundle, Message) -> HandlerResult + Send + Sync + 'static,
+    {
+        self.register_handoff(HandoffIntent::Handoff, f).await;
+    }
+
+    /// Register a handler for CHP handover-request messages.
+    ///
+    /// The handler is skipped for a message whose payload carries no readable
+    /// [`ContextBundle`].
+    pub async fn on_handover_request<F>(&self, f: F)
+    where
+        F: Fn(ContextBundle, Message) -> HandlerResult + Send + Sync + 'static,
+    {
+        self.register_handoff(HandoffIntent::HandoverRequest, f)
+            .await;
+    }
+
+    async fn register_handoff<F>(&self, intent: HandoffIntent, f: F)
     where
         F: Fn(ContextBundle, Message) -> HandlerResult + Send + Sync + 'static,
     {
         let handler: MessageHandler = Arc::new(move |msg| {
-            let bundle = extract_bundle_from_payload(&msg.payload)?;
+            let bundle = extract_bundle_from_payload(msg.payload.as_ref())?;
             f(bundle, msg)
         });
-        let intent_str = HandoffIntent::Handoff.as_str().to_string();
-        let mut h = self.handoff_handlers.blocking_write();
-        h.insert(intent_str, handler);
-    }
-
-    /// Register a handler for CHP HANDOVER_REQUEST messages
-    pub fn on_handover_request<F>(&self, f: F)
-    where
-        F: Fn(ContextBundle, Message) -> HandlerResult + Send + Sync + 'static,
-    {
-        let handler: MessageHandler = Arc::new(move |msg| {
-            let bundle = extract_bundle_from_payload(&msg.payload)?;
-            f(bundle, msg)
-        });
-        let intent_str = HandoffIntent::HandoverRequest.as_str().to_string();
-        let mut h = self.handoff_handlers.blocking_write();
-        h.insert(intent_str, handler);
+        self.handoff_handlers
+            .write()
+            .await
+            .insert(intent.as_str().to_string(), handler);
     }
 
     // ---- Send operations ----
 
-    /// Send a new message to a peer (originates from this agent or a human)
+    /// Send a new message to a peer, starting a fresh chain.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::UnknownPeer`] when `target_agent_id` is not
+    /// configured, or [`AgentError::Transport`] when delivery fails.
     pub async fn send_message(
         &self,
         target_agent_id: &str,
         payload: Value,
         origin: Option<Origin>,
-    ) -> anyhow::Result<Message> {
-        let peer = self.config.get_peer(target_agent_id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown peer: {}", target_agent_id))?;
+    ) -> Result<Message, AgentError> {
+        let peer = self
+            .config
+            .get_peer(target_agent_id)
+            .ok_or_else(|| AgentError::UnknownPeer(target_agent_id.to_string()))?;
 
-        let msg_id = new_msg_id();
-        let corr_id = new_corr_id();
-
-        let origin = origin.unwrap_or_else(|| Origin {
-            agent_id: Some(self.this.agent_id.clone()),
-            machine_id: self.this.machine_id.clone(),
-            human_id: None,
+        let envelope = build_envelope(NewEnvelope {
+            msg_id: new_msg_id(),
+            corr_id: new_corr_id(),
+            origin: origin.unwrap_or_else(|| Origin {
+                agent_id: Some(self.this.agent_id.clone()),
+                machine_id: self.this.machine_id.clone(),
+                human_id: None,
+            }),
+            sender: (&self.this.agent_id, self.machine_id()),
+            recipient: (&peer.agent_id, &peer.machine_id),
+            intent: Intent::Delegate,
+            reply_to_path: Some(vec![self.addr()]),
+            reply_to_ws_endpoint: self.this.ws_endpoint.clone(),
+            hops_max: DEFAULT_MAX_HOPS,
+            content_type: "application/json",
+            priority: Priority::Normal,
+            deadline: None,
         });
 
-        let envelope = build_envelope(
-            msg_id,
-            corr_id,
-            origin,
-            &self.this.agent_id,
-            self.this.machine_id.as_deref().unwrap_or(""),
-            &peer.agent_id,
-            &peer.machine_id,
-            Intent::Delegate,
-            Some(vec![format!(
-                "{}@{}",
-                self.this.agent_id,
-                self.this.machine_id.as_deref().unwrap_or("")
-            )]),
-            self.this.ws_endpoint.clone(),
-            10,
-            "application/json",
-            Priority::Normal,
-            None,
-        );
-
-        let message = Message::with_payload(envelope, payload.clone());
-        self.client
-            .send_with_retry(peer, &message)
-            .await
-            .map_err(|e| anyhow::anyhow!("Send failed: {}", e))?;
-
+        let message = Message::with_payload(envelope, payload);
+        self.client.send_with_retry(peer, &message).await?;
         Ok(message)
     }
 
-    /// Send a CHP handoff message to another agent
+    /// Send a CHP handoff bundle to another agent.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::Serialization`] when the bundle cannot be encoded,
+    /// or whatever [`ACPAgent::send_message`] returns.
     pub async fn send_handoff(
         &self,
         target_agent_id: &str,
         bundle: ContextBundle,
         origin: Option<Origin>,
-    ) -> anyhow::Result<Message> {
-        let handoff_msg = HandoffMessage::new(bundle, HandoffIntent::Handoff);
-
-        let payload = serde_json::to_value(&handoff_msg)?;
-
+    ) -> Result<Message, AgentError> {
+        let handoff = HandoffMessage::new(bundle, HandoffIntent::Handoff);
+        let payload = serde_json::to_value(&handoff)?;
         self.send_message(target_agent_id, payload, origin).await
     }
 
-    /// Forward an incoming message to another agent (delegate)
+    /// Forward an incoming message to another agent, extending the reply path.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::UnknownPeer`] when the target is not configured,
+    /// [`AgentError::HopsExceeded`] when the chain is out of hops, or
+    /// [`AgentError::Transport`] when delivery fails.
     pub async fn delegate_to(
         &self,
         target_agent_id: &str,
         original_message: &Message,
         additional_payload: Option<Value>,
-    ) -> anyhow::Result<Message> {
-        let peer = self.config.get_peer(target_agent_id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown peer: {}", target_agent_id))?;
+    ) -> Result<Message, AgentError> {
+        let peer = self
+            .config
+            .get_peer(target_agent_id)
+            .ok_or_else(|| AgentError::UnknownPeer(target_agent_id.to_string()))?;
 
         let new_envelope = forward_envelope(
             &original_message.envelope,
             &self.this.agent_id,
-            self.this.machine_id.as_deref().unwrap_or(""),
+            self.machine_id(),
             &peer.agent_id,
             &peer.machine_id,
-        )
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        )?;
 
-        let merged_payload = if let Some(add) = additional_payload {
-            merge_payload(original_message.payload.clone(), add)
-        } else {
-            original_message.payload.clone().unwrap_or(serde_json::Value::Null)
+        let merged_payload = match additional_payload {
+            Some(add) => merge_payload(original_message.payload.as_ref(), add),
+            None => original_message.payload.clone().unwrap_or(Value::Null),
         };
 
         let new_message = Message::with_payload(new_envelope, merged_payload);
+        self.track_pending(
+            &original_message.envelope.msg_id,
+            &new_message,
+            AgentState::Forwarding,
+        )
+        .await;
 
-        {
-            let mut pending = self.pending.write().await;
-            pending.insert(
-                original_message.envelope.msg_id.clone(),
-                PendingMessage {
-                    message: new_message.clone(),
-                    state: AgentState::Forwarding,
-                    retry_count: 0,
-                    created_at: now_f64(),
-                    stream_id: None,
-                },
-            );
-        }
-
-        self.client
-            .send_with_retry(peer, &new_message)
-            .await
-            .map_err(|e| anyhow::anyhow!("Delegate failed: {}", e))?;
-
+        self.client.send_with_retry(peer, &new_message).await?;
         Ok(new_message)
     }
 
-    /// Send a reply back along reply_to.path
+    /// Send a reply back along `reply_to.path`.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::ReplyPathEmpty`] when there is nowhere to reply to,
+    /// [`AgentError::UnroutableReply`] when the next hop is not a configured
+    /// peer, or [`AgentError::Transport`] when delivery fails.
     pub async fn reply_to(
         &self,
         original_message: &Message,
         payload: Value,
-    ) -> anyhow::Result<Message> {
+    ) -> Result<Message, AgentError> {
         let new_envelope = reply_envelope(
             &original_message.envelope,
             &self.this.agent_id,
-            self.this.machine_id.as_deref().unwrap_or(""),
-        )
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+            self.machine_id(),
+        )?;
 
-        let recipient_addr = format!(
-            "{}@{}",
-            new_envelope.recipient.agent_id,
-            new_envelope.recipient.machine_id.as_deref().unwrap_or("")
-        );
-
-        let peer = self.config.get_peer_by_addr(&recipient_addr)
-            .ok_or_else(|| anyhow::anyhow!("Peer not found for reply recipient: {}", recipient_addr))?;
+        let peer = self.resolve_reply_peer(&new_envelope.recipient.to_str(), "reply")?;
 
         let new_message = Message::with_payload(new_envelope, payload);
+        self.track_pending(
+            &original_message.envelope.msg_id,
+            &new_message,
+            AgentState::Replying,
+        )
+        .await;
 
-        {
-            let mut pending = self.pending.write().await;
-            pending.insert(
-                original_message.envelope.msg_id.clone(),
-                PendingMessage {
-                    message: new_message.clone(),
-                    state: AgentState::Replying,
-                    retry_count: 0,
-                    created_at: now_f64(),
-                    stream_id: None,
-                },
-            );
-        }
-
-        self.client
-            .send_with_retry(peer, &new_message)
-            .await
-            .map_err(|e| anyhow::anyhow!("Reply failed: {}", e))?;
-
+        self.client.send_with_retry(peer, &new_message).await?;
         Ok(new_message)
     }
 
-    /// Propagate an error back along the reply path
+    /// Propagate a failure back along the reply path.
+    ///
+    /// # Errors
+    /// The same failures as [`ACPAgent::reply_to`].
     pub async fn send_error(
         &self,
         original_message: &Message,
         error: &str,
         retryable: bool,
-    ) -> anyhow::Result<Message> {
+    ) -> Result<Message, AgentError> {
         let mut new_envelope = reply_envelope(
             &original_message.envelope,
             &self.this.agent_id,
-            self.this.machine_id.as_deref().unwrap_or(""),
-        )
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
+            self.machine_id(),
+        )?;
         new_envelope.error = Some(error.to_string());
         new_envelope.intent = Intent::Error;
 
-        let recipient_addr = format!(
-            "{}@{}",
-            new_envelope.recipient.agent_id,
-            new_envelope.recipient.machine_id.as_deref().unwrap_or("")
-        );
-
-        let peer = self.config.get_peer_by_addr(&recipient_addr)
-            .ok_or_else(|| anyhow::anyhow!("Peer not found for error recipient: {}", recipient_addr))?;
+        let peer = self.resolve_reply_peer(&new_envelope.recipient.to_str(), "error")?;
 
         let error_payload = serde_json::json!({
             "error": error,
             "retryable": retryable,
-            "failed_at": format!("{}@{}", self.this.agent_id, self.this.machine_id.as_deref().unwrap_or("")),
+            "failed_at": self.addr(),
         });
 
         let new_message = Message::with_payload(new_envelope, error_payload);
-
-        self.client
-            .send_with_retry(peer, &new_message)
-            .await
-            .map_err(|e| anyhow::anyhow!("Error send failed: {}", e))?;
-
+        self.client.send_with_retry(peer, &new_message).await?;
         Ok(new_message)
+    }
+
+    fn resolve_reply_peer(&self, addr: &str, context: &'static str) -> Result<&Peer, AgentError> {
+        self.config
+            .get_peer_by_addr(addr)
+            .ok_or_else(|| AgentError::UnroutableReply {
+                context,
+                addr: addr.to_string(),
+            })
     }
 
     // ---- Streaming ----
 
-    /// Initiate a stream for a reply
+    /// Open a stream for answering `original_message`, and return its ID.
     pub async fn initiate_stream(&self, original_message: &Message) -> String {
         let stream_id = new_stream_id();
         let mut pending = self.pending.write().await;
-        let entry = pending.entry(original_message.envelope.msg_id.clone()).or_insert(PendingMessage {
-            message: original_message.clone(),
-            state: AgentState::Processing,
-            retry_count: 0,
-            created_at: now_f64(),
-            stream_id: None,
-        });
+        let entry = pending
+            .entry(original_message.envelope.msg_id.clone())
+            .or_insert_with(|| PendingMessage {
+                message: original_message.clone(),
+                state: AgentState::Processing,
+                created_at: now_f64(),
+                stream_id: None,
+            });
         entry.stream_id = Some(stream_id.clone());
         stream_id
     }
 
-    /// Send a stream chunk back toward origin
+    /// Send one chunk of a streamed reply toward the origin.
+    ///
+    /// A message with an empty reply path has nowhere to stream to; that is
+    /// logged and treated as a no-op rather than an error.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::UnroutableReply`] when the next hop is not a
+    /// configured peer, or [`AgentError::Transport`] when delivery fails.
     pub async fn send_stream_chunk(
         &self,
         original_message: &Message,
@@ -415,25 +455,25 @@ impl ACPAgent {
         total: Option<u32>,
         data: Value,
         final_: bool,
-    ) -> anyhow::Result<()> {
-        let path = original_message.envelope.reply_to.as_ref()
-            .map(|rt| rt.path.clone())
-            .unwrap_or_default();
+    ) -> Result<(), AgentError> {
+        let first_hop = original_message
+            .envelope
+            .reply_to
+            .as_ref()
+            .and_then(|rt| rt.path.first().cloned());
 
-        let Some(next_hop_addr) = path.first().cloned() else {
-            tracing::warn!("No reply_to.path for stream {}", stream_id);
+        let Some(next_hop_addr) = first_hop else {
+            tracing::warn!("No reply_to.path for stream {stream_id}");
             return Ok(());
         };
 
-        let peer = self.config.get_peer_by_addr(&next_hop_addr)
-            .ok_or_else(|| anyhow::anyhow!("No peer for {}", next_hop_addr))?;
+        let peer = self.resolve_reply_peer(&next_hop_addr, "stream")?;
 
         let chunk_envelope = reply_envelope(
             &original_message.envelope,
             &self.this.agent_id,
-            self.this.machine_id.as_deref().unwrap_or(""),
-        )
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+            self.machine_id(),
+        )?;
 
         let chunk_message = Message::with_payload(
             chunk_envelope,
@@ -446,28 +486,28 @@ impl ACPAgent {
             }),
         );
 
-        self.client
-            .send_with_retry(peer, &chunk_message)
-            .await
-            .map_err(|e| anyhow::anyhow!("Stream chunk send failed: {}", e))?;
-
+        self.client.send_with_retry(peer, &chunk_message).await?;
         Ok(())
     }
 
-    /// Send a reply as a stream of chunks
+    /// Send a reply as a stream of chunks, then a summary reply.
+    ///
+    /// # Errors
+    /// The same failures as [`ACPAgent::send_stream_chunk`] and
+    /// [`ACPAgent::reply_to`].
     pub async fn stream_reply(
         &self,
         original_message: &Message,
         chunks: Vec<(Value, bool)>,
-    ) -> anyhow::Result<Message> {
+    ) -> Result<Message, AgentError> {
         let stream_id = self.initiate_stream(original_message).await;
-        let total = chunks.len() as u32;
+        let total = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
 
         for (seq, (data, final_)) in chunks.into_iter().enumerate() {
             self.send_stream_chunk(
                 original_message,
                 &stream_id,
-                seq as u32,
+                u32::try_from(seq).unwrap_or(u32::MAX),
                 Some(total),
                 data,
                 final_,
@@ -478,7 +518,7 @@ impl ACPAgent {
         let summary_payload = serde_json::json!({
             "stream_id": stream_id,
             "total_frames": total,
-            "origin": format!("{}@{}", self.this.agent_id, self.this.machine_id.as_deref().unwrap_or("")),
+            "origin": self.addr(),
         });
 
         self.reply_to(original_message, summary_payload).await
@@ -486,163 +526,172 @@ impl ACPAgent {
 
     // ---- Message processing ----
 
-    /// Process a received message
+    /// Dispatch a message to its handler.
+    ///
+    /// A payload carrying a CHP `intent` is offered to the handoff handlers
+    /// first; otherwise the envelope's intent selects the handler. Returns the
+    /// handler's reply payload, or `None` when nothing is registered.
     pub async fn process_message(&self, message: Message) -> HandlerResult {
         *self.state.write().await = AgentState::Processing;
 
-        tracing::info!("[DEBUG] process_message called, intent: {:?}", message.envelope.intent);
-
-        // Check if this is a CHP message
-        if let Some(ref payload) = message.payload {
-            if let Some(intent) = payload.get("intent").and_then(|v| v.as_str()) {
-                tracing::info!("[DEBUG] CHP intent found in payload: {}", intent);
-                let handoff_handlers = self.handoff_handlers.read().await;
-                if let Some(handler) = handoff_handlers.get(intent) {
-                    return handler(message);
-                }
+        if let Some(intent) = message
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("intent"))
+            .and_then(Value::as_str)
+        {
+            let handoff_handlers = self.handoff_handlers.read().await;
+            if let Some(handler) = handoff_handlers.get(intent) {
+                tracing::debug!("Dispatching CHP intent {intent}");
+                return handler(message);
             }
         }
 
-        // Standard ACP handler
-        let intent_str = message.envelope.intent.as_str().to_string();
-        tracing::info!("[DEBUG] Looking for handler for intent: {}", intent_str);
+        let intent = message.envelope.intent.as_str();
         let handlers = self.handlers.read().await;
-        tracing::info!("[DEBUG] Available handlers: {:?}", handlers.keys().collect::<Vec<_>>());
-
-        if let Some(handler) = handlers.get(&intent_str) {
-            handler(message)
-        } else {
-            tracing::warn!("No handler for intent: {}", intent_str);
-            None
-        }
+        let Some(handler) = handlers.get(intent) else {
+            tracing::warn!("No handler for intent: {intent}");
+            return None;
+        };
+        handler(message)
     }
 
-    /// Handle an incoming message — process and auto-reply if handler returns result
+    /// Record an incoming message, dispatch it, and auto-reply when the handler
+    /// returns a payload and the message carries a reply path.
     pub async fn handle_incoming(&self, message: Message) {
-        let msg_id = message.envelope.msg_id.clone();
-
-        // Store in inbox for dashboard
-        {
-            let mut inbox = self.inbox.write().await;
-            inbox.push(InboxEntry {
-                msg_id: message.envelope.msg_id.clone(),
-                corr_id: message.envelope.corr_id.clone().unwrap_or_default(),
-                sender_agent: message.envelope.sender.agent_id.clone(),
-                sender_machine: message.envelope.sender.machine_id.clone().unwrap_or_default(),
-                recipient_agent: message.envelope.recipient.agent_id.clone(),
-                recipient_machine: message.envelope.recipient.machine_id.clone().unwrap_or_default(),
-                intent: message.envelope.intent.as_str().to_string(),
-                payload: message.payload.clone(),
-                status: "received".to_string(),
-                error: message.envelope.error.clone().unwrap_or_default(),
-                received_at: now_f64(),
-            });
-        }
-
-        {
-            let mut pending = self.pending.write().await;
-            pending.insert(
-                msg_id.clone(),
-                PendingMessage {
-                    message: message.clone(),
-                    state: AgentState::Received,
-                    retry_count: 0,
-                    created_at: now_f64(),
-                    stream_id: None,
-                },
-            );
-        }
-
+        self.record_inbox(&message).await;
+        self.track_pending(&message.envelope.msg_id, &message, AgentState::Received)
+            .await;
         *self.state.write().await = AgentState::Received;
 
         let result = self.process_message(message.clone()).await;
 
+        let mut final_state = AgentState::Complete;
         if let Some(result_payload) = result {
             if message.envelope.reply_to.is_some() {
                 if let Err(e) = self.reply_to(&message, result_payload).await {
-                    tracing::warn!("Auto-reply failed: {}", e);
+                    tracing::warn!("Auto-reply failed: {e}");
+                    final_state = AgentState::Failed;
                 }
             }
         }
 
-        *self.state.write().await = AgentState::Complete;
+        *self.state.write().await = final_state;
+    }
+
+    async fn record_inbox(&self, message: &Message) {
+        let envelope = &message.envelope;
+        self.inbox.write().await.push(InboxEntry {
+            msg_id: envelope.msg_id.clone(),
+            corr_id: envelope.corr_id.clone().unwrap_or_default(),
+            sender_agent: envelope.sender.agent_id.clone(),
+            sender_machine: envelope.sender.machine_id.clone().unwrap_or_default(),
+            recipient_agent: envelope.recipient.agent_id.clone(),
+            recipient_machine: envelope.recipient.machine_id.clone().unwrap_or_default(),
+            intent: envelope.intent.as_str().to_string(),
+            payload: message.payload.clone(),
+            status: "received".to_string(),
+            error: envelope.error.clone().unwrap_or_default(),
+            received_at: now_f64(),
+        });
+    }
+
+    async fn track_pending(&self, key: &str, message: &Message, state: AgentState) {
+        self.pending.write().await.insert(
+            key.to_string(),
+            PendingMessage {
+                message: message.clone(),
+                state,
+                created_at: now_f64(),
+                stream_id: None,
+            },
+        );
     }
 
     // ---- Server lifecycle ----
 
-    /// Start the HTTP server (blocking)
-    pub async fn run(&self) -> anyhow::Result<()> {
-        *self.running.write().await = true;
+    /// Run until interrupted.
+    ///
+    /// HTTP serving lives in [`crate::server::start_server`]; this only holds the
+    /// process open and tracks agent state.
+    ///
+    /// # Errors
+    /// Returns [`AgentError::Io`] when the interrupt handler cannot be installed.
+    pub async fn run(&self) -> Result<(), AgentError> {
         *self.state.write().await = AgentState::Idle;
+        tracing::info!("[{}] ACP Agent running", self.this.agent_id);
 
-        let addr = self.this.http_endpoint.as_ref()
-            .and_then(|ep| ep.split(':').nth(1))
-            .unwrap_or("8443");
-
-        tracing::info!("[{}] ACP Agent starting on port {}", self.this.agent_id, addr);
-
-        // TODO: integrate with server module
-        // For now, just keep running
         tokio::signal::ctrl_c().await?;
-        *self.running.write().await = false;
         Ok(())
     }
 
-    /// Stop the agent
+    /// Return the agent to [`AgentState::Idle`].
     pub async fn stop(&self) {
-        *self.running.write().await = false;
         *self.state.write().await = AgentState::Idle;
     }
 
-    /// Get current state
+    /// Where the agent currently stands.
     pub async fn state(&self) -> AgentState {
-        self.state.read().await.clone()
+        *self.state.read().await
     }
 
-    /// Get all inbox entries (incoming messages)
+    /// Every message received so far.
     pub async fn get_inbox(&self) -> Vec<InboxEntry> {
         self.inbox.read().await.clone()
     }
 
-    /// Get all peers from config
+    /// Every peer this agent can address.
+    #[must_use]
     pub fn get_peers(&self) -> Vec<Peer> {
         self.config.peers.clone()
     }
 
-    /// Get all messages (inbox + pending) for dashboard
-    pub async fn get_all_messages(&self) -> Vec<serde_json::Value> {
-        let mut result = Vec::new();
-
-        // Inbox entries
+    /// Received and in-flight messages, as JSON for the dashboard.
+    ///
+    /// Inbox entries win over pending ones with the same `msg_id`.
+    pub async fn get_all_messages(&self) -> Vec<Value> {
         let inbox = self.inbox.read().await;
-        for entry in inbox.iter() {
-            result.push(serde_json::json!({
-                "msg_id": entry.msg_id,
-                "corr_id": entry.corr_id,
-                "sender_agent": entry.sender_agent,
-                "recipient_agent": entry.recipient_agent,
-                "intent": entry.intent,
-                "status": entry.status,
-                "error": entry.error,
-                "payload": entry.payload,
-            }));
-        }
+        let mut result: Vec<Value> = inbox
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "msg_id": entry.msg_id,
+                    "corr_id": entry.corr_id,
+                    "sender_agent": entry.sender_agent,
+                    "sender_machine": entry.sender_machine,
+                    "recipient_agent": entry.recipient_agent,
+                    "recipient_machine": entry.recipient_machine,
+                    "intent": entry.intent,
+                    "status": entry.status,
+                    "error": entry.error,
+                    "payload": entry.payload,
+                    "received_at": entry.received_at,
+                })
+            })
+            .collect();
 
-        // Pending outgoing entries
         let pending = self.pending.read().await;
         for (msg_id, pending_msg) in pending.iter() {
-            let env = &pending_msg.message.envelope;
-            if !result.iter().any(|m| m.get("msg_id").and_then(|v| v.as_str()) == Some(msg_id)) {
-                result.push(serde_json::json!({
-                    "msg_id": env.msg_id,
-                    "corr_id": env.corr_id,
-                    "sender_agent": env.sender.agent_id,
-                    "recipient_agent": env.recipient.agent_id,
-                    "intent": env.intent.as_str(),
-                    "status": format!("{:?}", pending_msg.state).to_lowercase(),
-                    "error": env.error.as_deref().unwrap_or(""),
-                }));
+            if result
+                .iter()
+                .any(|m| m.get("msg_id").and_then(Value::as_str) == Some(msg_id.as_str()))
+            {
+                continue;
             }
+            let env = &pending_msg.message.envelope;
+            result.push(serde_json::json!({
+                "msg_id": env.msg_id,
+                "corr_id": env.corr_id,
+                "sender_agent": env.sender.agent_id,
+                "sender_machine": env.sender.machine_id,
+                "recipient_agent": env.recipient.agent_id,
+                "recipient_machine": env.recipient.machine_id,
+                "intent": env.intent.as_str(),
+                "status": pending_msg.state.as_str(),
+                "error": env.error.as_deref().unwrap_or(""),
+                "stream_id": pending_msg.stream_id,
+                "received_at": pending_msg.created_at,
+            }));
         }
 
         result
@@ -660,20 +709,20 @@ fn now_f64() -> f64 {
         .unwrap_or(0.0)
 }
 
-fn extract_bundle_from_payload(payload: &Option<Value>) -> Option<ContextBundle> {
-    let payload = payload.as_ref()?;
-    let bundle_val = payload.get("bundle")?;
-    let bundle: ContextBundle = serde_json::from_value(bundle_val.clone()).ok()?;
-    Some(bundle)
+fn extract_bundle_from_payload(payload: Option<&Value>) -> Option<ContextBundle> {
+    let bundle_val = payload?.get("bundle")?;
+    serde_json::from_value(bundle_val.clone()).ok()
 }
 
-fn merge_payload(original: Option<Value>, additional: Value) -> Value {
-    match (original, additional) {
-        (Some(obj), add_obj) if obj.is_object() && add_obj.is_object() => {
-            let mut merged = obj.as_object().unwrap().clone();
-            for (k, v) in add_obj.as_object().unwrap() {
-                merged.insert(k.clone(), v.clone());
-            }
+/// Overlay `additional` onto `original`.
+///
+/// Two JSON objects merge key-by-key; anything else is replaced outright, since
+/// there is no meaningful way to overlay a scalar.
+fn merge_payload(original: Option<&Value>, additional: Value) -> Value {
+    match (original.and_then(Value::as_object), additional) {
+        (Some(base), Value::Object(add)) => {
+            let mut merged = base.clone();
+            merged.extend(add);
             Value::Object(merged)
         }
         (_, add) => add,
@@ -681,35 +730,57 @@ fn merge_payload(original: Option<Value>, additional: Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Default handlers
+// Tests
 // ---------------------------------------------------------------------------
 
-impl ACPAgent {
-    fn default_delegate_handler(msg: Message) -> HandlerResult {
-        tracing::info!(
-            "[agent] Received delegate: {} from {}",
-            msg.envelope.msg_id,
-            msg.envelope.sender.agent_id
-        );
-        None
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merging_two_objects_keeps_untouched_keys() {
+        let original = serde_json::json!({"a": 1, "b": 2});
+
+        let merged = merge_payload(Some(&original), serde_json::json!({"b": 3}));
+
+        assert_eq!(merged["a"], 1);
     }
 
-    fn default_reply_handler(msg: Message) -> HandlerResult {
-        tracing::info!(
-            "[agent] Received reply: {} from {}",
-            msg.envelope.msg_id,
-            msg.envelope.sender.agent_id
-        );
-        None
+    #[test]
+    fn merging_two_objects_overwrites_shared_keys() {
+        let original = serde_json::json!({"a": 1, "b": 2});
+
+        let merged = merge_payload(Some(&original), serde_json::json!({"b": 3}));
+
+        assert_eq!(merged["b"], 3);
     }
 
-    fn default_error_handler(msg: Message) -> HandlerResult {
-        let err = msg.envelope.error.as_deref().unwrap_or("unknown");
-        tracing::error!(
-            "[agent] Error from {}: {}",
-            msg.envelope.sender.agent_id,
-            err
+    #[test]
+    fn merging_onto_a_non_object_replaces_it() {
+        let original = serde_json::json!("scalar");
+
+        let merged = merge_payload(Some(&original), serde_json::json!({"b": 3}));
+
+        assert_eq!(merged, serde_json::json!({"b": 3}));
+    }
+
+    #[test]
+    fn a_payload_without_a_bundle_yields_none() {
+        let payload = serde_json::json!({"intent": "handoff"});
+
+        assert!(extract_bundle_from_payload(Some(&payload)).is_none());
+    }
+
+    #[test]
+    fn a_payload_with_a_bundle_yields_it() {
+        let handoff = HandoffMessage::new(
+            acp_core::chp::build_handoff("outcome", "stop", "T1", "desc", "agent-alpha"),
+            HandoffIntent::Handoff,
         );
-        None
+        let payload = serde_json::to_value(&handoff).unwrap();
+
+        let bundle = extract_bundle_from_payload(Some(&payload)).unwrap();
+
+        assert_eq!(bundle.active_work.task_id, "T1");
     }
 }

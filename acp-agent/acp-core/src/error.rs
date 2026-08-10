@@ -1,58 +1,48 @@
 //! ACP Core error types
+//!
+//! Each module owns a precise error type — [`crate::config::ConfigError`],
+//! [`crate::security::TokenError`], [`crate::transport::TransportError`]. [`enum@Error`]
+//! is the crate-wide union for callers that handle any of them at one boundary.
 
 use thiserror::Error;
 
-// ---------------------------------------------------------------------------
-// Top-level error type
-// ---------------------------------------------------------------------------
+use crate::config::ConfigError;
+use crate::protocol::{HopsExceededError, ReplyPathEmptyError};
+use crate::security::TokenError;
+use crate::transport::TransportError;
 
+/// Any failure originating inside `acp-core`.
 #[derive(Error, Debug)]
 pub enum Error {
+    /// A message could not be built, parsed, or routed.
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    /// A token could not be minted or verified.
     #[error("Security error: {0}")]
-    Security(String),
+    Security(#[from] TokenError),
 
+    /// A peer could not be reached, or refused a request.
     #[error("Transport error: {0}")]
-    Transport(String),
+    Transport(#[from] TransportError),
 
+    /// The peer config could not be loaded.
     #[error("Config error: {0}")]
-    Config(String),
+    Config(#[from] ConfigError),
 
+    /// A context handoff could not be built or read.
     #[error("CHP error: {0}")]
     Chp(String),
 
+    /// A forward would have pushed the chain past its hop ceiling.
     #[error("Hops exceeded: {0}")]
-    HopsExceeded(String),
+    HopsExceeded(#[from] HopsExceededError),
 
+    /// A reply had nowhere to go.
     #[error("Reply path empty: {0}")]
-    ReplyPathEmpty(String),
+    ReplyPathEmpty(#[from] ReplyPathEmptyError),
 
+    /// A file could not be read or written.
     #[error("IO error: {0}")]
-    Io(String),
-}
-
-impl From<crate::protocol::HopsExceededError> for Error {
-    fn from(e: crate::protocol::HopsExceededError) -> Self {
-        Error::HopsExceeded(e.to_string())
-    }
-}
-
-impl From<crate::protocol::ReplyPathEmptyError> for Error {
-    fn from(e: crate::protocol::ReplyPathEmptyError) -> Self {
-        Error::ReplyPathEmpty(e.to_string())
-    }
-}
-
-impl From<crate::config::ConfigError> for Error {
-    fn from(e: crate::config::ConfigError) -> Self {
-        Error::Config(e.to_string())
-    }
-}
-
-impl From<crate::security::TokenError> for Error {
-    fn from(e: crate::security::TokenError) -> Self {
-        Error::Security(e.to_string())
-    }
+    Io(#[from] std::io::Error),
 }

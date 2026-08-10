@@ -5,6 +5,17 @@ members = [
     "acp-agent",
 ]
 
+[workspace.lints.rust]
+future-incompatible = { level = "warn", priority = -2 }
+nonstandard_style = { level = "deny", priority = -3 }
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+redundant_clone = "deny"
+manual_while_let_some = "deny"
+pedantic = { level = "warn", priority = -1 }
+
 [profile.release]
 opt-level = 3
 lto = true
