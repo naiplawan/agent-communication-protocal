@@ -1,21 +1,14 @@
 config_version: 1
 
 this_agent:
-  agent_id: opencode-agent
-  machine_id: opencode-machine
+  agent_id: naiplawan-agent
+  machine_id: naiplawan-machine
   http_endpoint: http://localhost:8444
   capabilities:
     - agent
+    - signaling
 
 peers:
-  - agent_id: naiplawan-agent
-    machine_id: naiplawan-machine
-    # The relay is the reachable endpoint; it routes by recipient identity.
-    http_endpoint: http://localhost:8443
-    capabilities:
-      - signaling
-      - agent
-
   - agent_id: acp-relay
     machine_id: relay
     http_endpoint: http://localhost:8443

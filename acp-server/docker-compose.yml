@@ -56,13 +56,12 @@ services:
     build:
       context: ../acp-agent/acp-dashboard
       dockerfile: Dockerfile
+      args:
+        VITE_RELAY_URL: http://relay:8443
     container_name: acp-dashboard
     hostname: dashboard
     ports:
       - "3000:3000"
-    environment:
-      - ACP_RELAY_URL=http://relay:8443
-      - ACP_SHARED_SECRET=${ACP_SHARED_SECRET}
     depends_on:
       relay:
         condition: service_healthy

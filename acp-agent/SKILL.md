@@ -96,15 +96,16 @@ let bundle = build_handoff(
 agent.send_handoff("agent-beta", bundle).await?;
 ```
 
-## LLM Agent Integration
+## Remote Agent Integration
 
-The `llm-agent/` directory provides a Node.js agent powered by OpenRouter:
+A remote agent behind NAT registers with the relay and polls it for work:
 
 ```bash
-cd llm-agent
-cp .env.remote-agent.example .env.remote-agent
-# Edit .env.remote-agent with your settings
-docker compose -f docker-compose.remote-agent.yml up -d
+ACP_RELAY_URL=http://<relay-host>:8443 \
+ACP_AGENT_ID=my-agent \
+ACP_MACHINE_ID=my-machine \
+ACP_SHARED_SECRET=<secret> \
+cargo run --release -- run --port 8444 --use-signaling
 ```
 
 Environment variables:
@@ -112,7 +113,7 @@ Environment variables:
 - `ACP_AGENT_ID` — this agent's ID
 - `ACP_MACHINE_ID` — this machine's ID
 - `ACP_SHARED_SECRET` — HMAC signing secret
-- `OPENROUTER_API_KEY` — model API key
+- `ACP_HTTP_ENDPOINT` — public URL of this agent
 
 ## Security
 

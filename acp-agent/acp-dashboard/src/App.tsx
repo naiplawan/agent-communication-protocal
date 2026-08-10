@@ -40,7 +40,7 @@ import { Button } from './components/ui/button';
 
 const POLL_INTERVAL = 10_000;
 
-type RelayStatus = { status: string; agent: string };
+type RelayStatus = { status: string; agent: string; this_agent_id?: string; this_machine_id?: string };
 
 // ─── Data Hook ────────────────────────────────────────────────────────────────
 
@@ -128,6 +128,7 @@ function AgentAvatar({ agentId, status }: { agentId: string; status: string }) {
 function Shell({ relay, soundEnabled, onToggleSound, children }: { relay: RelayStatus; soundEnabled: boolean; onToggleSound: () => void; children: React.ReactNode }) {
   const location = useLocation();
   const online = relay.status === 'ok';
+  const isAgent = !!relay.this_agent_id;
   const navItems = [
     { to: '/', icon: <SlidersHorizontal size={16} />, label: 'Dashboard' },
     { to: '/inbox', icon: <InboxIcon size={16} />, label: 'Inbox', live: online },
@@ -149,7 +150,11 @@ function Shell({ relay, soundEnabled, onToggleSound, children }: { relay: RelayS
         <div className="topbar-right">
           <div className="relay-pill">
             <StatusDot status={online ? 'online' : 'offline'} />
-            <span>{online ? 'Relay live' : relay.status}</span>
+            <span>{online
+              ? isAgent
+                ? `Agent: ${relay.this_agent_id}`
+                : 'Relay live'
+              : relay.status}</span>
           </div>
           <Button variant="icon" className="icon-btn sound-btn" title={soundEnabled ? 'Mute message notifications' : 'Enable message notifications'} onClick={onToggleSound}>
             {soundEnabled ? <Volume2 size={15} /> : <VolumeX size={15} />}
@@ -178,8 +183,8 @@ function Shell({ relay, soundEnabled, onToggleSound, children }: { relay: RelayS
           <div className="relay-card">
             <StatusDot status={online ? 'online' : 'offline'} />
             <div className="relay-card-text">
-              <strong>{relay.agent || 'Relay'}</strong>
-              <small>{online ? 'Connected · v1.0' : 'Disconnected'}</small>
+              <strong>{isAgent ? relay.this_agent_id : relay.agent || 'Relay'}</strong>
+              <small>{online ? `${isAgent ? 'Agent' : 'Relay'} · v1.0` : 'Disconnected'}</small>
             </div>
           </div>
           <p className="sidebar-note">Auto-refreshes every 10s · Click any metric to explore</p>
@@ -289,8 +294,8 @@ function Dashboard({ data }: { data: ReturnType<typeof useData> }) {
             </div>
             <div className="health-banner-body">
               <p className="eyebrow">System</p>
-              <h2>{relay.status === 'ok' ? 'All systems operational' : 'Relay needs attention'}</h2>
-              <p>{relay.agent || 'No relay identity'} · ACP v1.0</p>
+              <h2>{relay.status === 'ok' ? 'All systems operational' : relay.this_agent_id ? 'Agent needs attention' : 'Relay needs attention'}</h2>
+              <p>{relay.this_agent_id ? `${relay.this_agent_id}@${relay.this_machine_id || 'unknown'}` : relay.agent || 'No identity'} · ACP v1.0</p>
             </div>
             <StatusBadge value={relay.status} />
           </section>
@@ -440,7 +445,7 @@ function Inbox({ data }: { data: ReturnType<typeof useData> }) {
       <PageHeader
         eyebrow="Messages"
         title="Inbox"
-        description="Every message that passes through the relay — searchable and filterable."
+        description="Messages involving this agent — searchable and filterable."
         actions={
           <Button variant="primary" onClick={() => setComposeOpen(true)}>
             <Send size={14} /> New message
@@ -601,6 +606,8 @@ function Inbox({ data }: { data: ReturnType<typeof useData> }) {
           onClose={() => setComposeOpen(false)}
           onSent={() => { setComposeOpen(false); void data.load(); }}
           agents={data.agents}
+          thisAgentId={data.relay.this_agent_id || 'naiplawan-agent'}
+          thisMachineId={data.relay.this_machine_id || 'naiplawan-machine'}
         />
       )}
     </div>
@@ -698,7 +705,7 @@ type SetupConfig = {
 };
 
 const defaultSetup: SetupConfig = {
-  relayUrl: 'http://localhost:8443',
+  relayUrl: 'http://localhost:8444',
   agentId: 'my-agent',
   machineId: 'my-machine',
   endpoint: 'http://localhost:8444',
@@ -823,14 +830,14 @@ function Setup() {
 
           <div className="panel-header panel-header--step">
             <div>
-              <p className="eyebrow">Step 2 — Relay</p>
+              <p className="eyebrow">Step 2 — Server</p>
               <h2>Connection</h2>
             </div>
             <span className="step-num">02</span>
           </div>
           <div className="form-body">
             <label className="form-label form-label--full">
-              Relay URL
+              Server URL <span className="form-hint">Agent or Relay endpoint</span>
               <input
                 className="form-input"
                 value={config.relayUrl}
@@ -901,10 +908,14 @@ function ComposeModal({
   onClose,
   onSent,
   agents,
+  thisAgentId,
+  thisMachineId,
 }: {
   onClose: () => void;
   onSent: () => void;
   agents: AgentHealth[];
+  thisAgentId: string;
+  thisMachineId: string;
 }) {
   const [recipient, setRecipient] = useState('naiplawan-agent');
   const [message, setMessage] = useState('');
@@ -933,14 +944,14 @@ function ComposeModal({
     setSending(true);
     setError(null);
     const msgId = `msg_${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}`;
-    const sender = { agent_id: 'opencode-agent', machine_id: 'opencode-machine' };
+    const sender = { agent_id: thisAgentId, machine_id: thisMachineId };
     const envelope = {
       msg_id: msgId,
       corr_id: msgId,
       origin: sender,
       sender,
-      recipient: { agent_id: recipient.trim(), machine_id: 'naiplawan-machine' },
-      reply_to: { path: ['opencode-agent@opencode-machine'] },
+      recipient: { agent_id: recipient.trim(), machine_id: thisMachineId },
+      reply_to: [`${thisAgentId}@${thisMachineId}`],
       hops: { count: 0, max: 10, trace: [] },
       intent: 'delegate',
       content_type: 'application/json',

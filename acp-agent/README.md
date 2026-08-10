@@ -19,15 +19,13 @@ acp-agent/
 │       ├── agent.rs       # ACPAgent struct
 │       ├── server.rs      # HTTP server
 │       └── signaling.rs   # Relay client
-├── acp-dashboard/  # Web dashboard (Vite + React + TypeScript)
-│   ├── src/
-│   │   ├── App.tsx        # Main dashboard component
-│   │   ├── api.ts         # Dashboard API client
-│   │   ├── types.ts       # TypeScript types
-│   │   └── components/    # UI components
-│   └── vite.config.ts     # Vite bundler config
-└── llm-agent/      # LLM-powered agent (Node.js + OpenRouter SDK)
-    └── index.mjs         # Main entry point
+└── acp-dashboard/  # Web dashboard (Vite + React + TypeScript)
+    ├── src/
+    │   ├── App.tsx        # Main dashboard component
+    │   ├── api.ts         # Dashboard API client
+    │   ├── types.ts       # TypeScript types
+    │   └── components/    # UI components
+    └── vite.config.ts     # Vite bundler config
 ```
 
 ## Features
@@ -51,13 +49,8 @@ cargo build --release
 ```bash
 cd acp-dashboard
 npm install
-npm run build
-```
-
-### LLM Agent
-```bash
-cd llm-agent
-npm install
+# VITE_RELAY_URL is baked in at build time; point it at an agent or the relay
+VITE_RELAY_URL=http://localhost:8444 npm run build
 ```
 
 ## Run
@@ -90,9 +83,24 @@ acp-agent listen [--poll-interval <seconds>]
 acp-agent doctor [--target <agent-id>]
 ```
 
+## HTTP API
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/health` | Status plus `this_agent_id` / `this_machine_id` |
+| `GET` | `/acp/v1/peers` | Peers from the loaded config |
+| `GET` | `/acp/v1/messages/pending` | Inbox and pending outgoing messages |
+| `GET` | `/acp/v1/debug/messages` | Same message list, unwrapped, for debugging |
+| `POST` | `/acp/v1/messages/send` | Send a message to a peer |
+| `POST` | `/acp/v1/messages/{msg_id}/ack` | Acknowledge a message |
+| `POST` | `/acp/v1/messages/{msg_id}/error` | Report a processing error |
+| `POST` | `/acp/v1/stream/init` | Open a stream for a large reply |
+
+Incoming messages are kept in an in-memory inbox, which is what the dashboard renders when it is pointed at an agent rather than the relay.
+
 ## Configuration
 
-Create `acp-peers.yaml`:
+Create `acp-peers.yaml` (see `acp-peers-naiplawan.yaml` for a working local example):
 
 ```yaml
 config_version: 1

@@ -9,8 +9,7 @@ acp-agent/
 ├── acp-core/           Shared Rust protocol types
 ├── acp-agent/          Rust agent CLI and library
 ├── acp-dashboard/      Web dashboard (Vite + React + TypeScript)
-├── llm-agent/          LLM-powered agent (Node.js + OpenRouter SDK)
-├── acp-peers-opencode.yaml  Example peer config for opencode relay
+├── acp-peers-naiplawan.yaml  Example peer config (local agent + relay peer)
 ├── PROTOCOL.md         Protocol specification
 ├── SETUP.md            Standard setup guide
 └── SETUP-LAN.md        Two-laptop LAN setup guide
@@ -72,6 +71,34 @@ cargo build --release
 ```
 
 The Rust CLI also accepts `run --use-signaling` when relay signaling is configured through the environment.
+
+## Agent HTTP API
+
+A running agent exposes:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/health` | Status plus this agent's `this_agent_id` / `this_machine_id` |
+| `GET` | `/acp/v1/peers` | Peers from the loaded config |
+| `GET` | `/acp/v1/messages/pending` | Inbox and pending outgoing messages |
+| `GET` | `/acp/v1/debug/messages` | Same message list, unwrapped, for debugging |
+| `POST` | `/acp/v1/messages/send` | Send a message to a peer |
+| `POST` | `/acp/v1/messages/{msg_id}/ack` | Acknowledge a message |
+| `POST` | `/acp/v1/messages/{msg_id}/error` | Report a processing error |
+| `POST` | `/acp/v1/stream/init` | Open a stream for a large reply |
+
+The dashboard talks to these endpoints, so it can point at either an agent or the relay.
+
+## Dashboard
+
+The dashboard reads its backend URL from `VITE_RELAY_URL`, which is baked in at build time:
+
+```bash
+cd acp-agent/acp-dashboard
+VITE_RELAY_URL=http://localhost:8444 npm run build
+```
+
+In Docker the same value is passed as a build argument (`docker compose` sets it to `http://relay:8443`). When it points at an agent, the dashboard shows that agent's identity and its own inbox instead of relay-wide traffic.
 
 ## Configuration
 

@@ -2,7 +2,7 @@
 //!
 //! Includes ACP-CHP: Context Handoff Protocol support.
 
-use acp_core::config::{load_config, resolve_this_agent, ACPConfig, ThisAgent};
+use acp_core::config::{load_config, resolve_this_agent, ACPConfig, ThisAgent, Peer};
 use acp_core::protocol::{
     self, build_envelope, forward_envelope, reply_envelope, new_msg_id, new_corr_id,
     new_stream_id, Envelope, Message, Origin, Intent, Priority, HopsExceededError,
@@ -45,6 +45,21 @@ impl Default for AgentState {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
+pub struct InboxEntry {
+    pub msg_id: String,
+    pub corr_id: String,
+    pub sender_agent: String,
+    pub sender_machine: String,
+    pub recipient_agent: String,
+    pub recipient_machine: String,
+    pub intent: String,
+    pub payload: Option<Value>,
+    pub status: String,
+    pub error: String,
+    pub received_at: f64,
+}
+
+#[derive(Debug, Clone)]
 pub struct PendingMessage {
     pub message: Message,
     pub state: AgentState,
@@ -72,6 +87,7 @@ pub struct ACPAgent {
     handlers: Arc<RwLock<HashMap<String, MessageHandler>>>,
     handoff_handlers: Arc<RwLock<HashMap<String, MessageHandler>>>,
     pending: Arc<RwLock<HashMap<String, PendingMessage>>>,
+    inbox: Arc<RwLock<Vec<InboxEntry>>>,
     state: Arc<RwLock<AgentState>>,
     running: Arc<RwLock<bool>>,
 }
@@ -102,6 +118,7 @@ impl ACPAgent {
             handlers: Arc::new(RwLock::new(HashMap::new())),
             handoff_handlers: Arc::new(RwLock::new(HashMap::new())),
             pending: Arc::new(RwLock::new(HashMap::new())),
+            inbox: Arc::new(RwLock::new(Vec::new())),
             state: Arc::new(RwLock::new(AgentState::Idle)),
             running: Arc::new(RwLock::new(false)),
         })
@@ -504,6 +521,24 @@ impl ACPAgent {
     pub async fn handle_incoming(&self, message: Message) {
         let msg_id = message.envelope.msg_id.clone();
 
+        // Store in inbox for dashboard
+        {
+            let mut inbox = self.inbox.write().await;
+            inbox.push(InboxEntry {
+                msg_id: message.envelope.msg_id.clone(),
+                corr_id: message.envelope.corr_id.clone().unwrap_or_default(),
+                sender_agent: message.envelope.sender.agent_id.clone(),
+                sender_machine: message.envelope.sender.machine_id.clone().unwrap_or_default(),
+                recipient_agent: message.envelope.recipient.agent_id.clone(),
+                recipient_machine: message.envelope.recipient.machine_id.clone().unwrap_or_default(),
+                intent: message.envelope.intent.as_str().to_string(),
+                payload: message.payload.clone(),
+                status: "received".to_string(),
+                error: message.envelope.error.clone().unwrap_or_default(),
+                received_at: now_f64(),
+            });
+        }
+
         {
             let mut pending = self.pending.write().await;
             pending.insert(
@@ -562,6 +597,55 @@ impl ACPAgent {
     /// Get current state
     pub async fn state(&self) -> AgentState {
         self.state.read().await.clone()
+    }
+
+    /// Get all inbox entries (incoming messages)
+    pub async fn get_inbox(&self) -> Vec<InboxEntry> {
+        self.inbox.read().await.clone()
+    }
+
+    /// Get all peers from config
+    pub fn get_peers(&self) -> Vec<Peer> {
+        self.config.peers.clone()
+    }
+
+    /// Get all messages (inbox + pending) for dashboard
+    pub async fn get_all_messages(&self) -> Vec<serde_json::Value> {
+        let mut result = Vec::new();
+
+        // Inbox entries
+        let inbox = self.inbox.read().await;
+        for entry in inbox.iter() {
+            result.push(serde_json::json!({
+                "msg_id": entry.msg_id,
+                "corr_id": entry.corr_id,
+                "sender_agent": entry.sender_agent,
+                "recipient_agent": entry.recipient_agent,
+                "intent": entry.intent,
+                "status": entry.status,
+                "error": entry.error,
+                "payload": entry.payload,
+            }));
+        }
+
+        // Pending outgoing entries
+        let pending = self.pending.read().await;
+        for (msg_id, pending_msg) in pending.iter() {
+            let env = &pending_msg.message.envelope;
+            if !result.iter().any(|m| m.get("msg_id").and_then(|v| v.as_str()) == Some(msg_id)) {
+                result.push(serde_json::json!({
+                    "msg_id": env.msg_id,
+                    "corr_id": env.corr_id,
+                    "sender_agent": env.sender.agent_id,
+                    "recipient_agent": env.recipient.agent_id,
+                    "intent": env.intent.as_str(),
+                    "status": format!("{:?}", pending_msg.state).to_lowercase(),
+                    "error": env.error.as_deref().unwrap_or(""),
+                }));
+            }
+        }
+
+        result
     }
 }
 

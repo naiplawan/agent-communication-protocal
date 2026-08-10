@@ -129,10 +129,17 @@ fn with_cors(body: impl IntoResponse) -> Response {
 // ---------------------------------------------------------------------------
 
 // GET /health
-async fn health() -> impl IntoResponse {
+async fn health(State(state): State<SharedState>) -> impl IntoResponse {
+    let agent_guard = state.agent.read().await;
+    let (agent_id, machine_id) = match agent_guard.as_ref() {
+        Some(a) => (a.this.agent_id.clone(), a.this.machine_id.clone().unwrap_or_default()),
+        None => ("unknown".to_string(), "unknown".to_string()),
+    };
     with_cors(Json(serde_json::json!({
         "status": "ok",
-        "agent": "acp-agent"
+        "agent": "acp-agent",
+        "this_agent_id": agent_id,
+        "this_machine_id": machine_id,
     })))
 }
 
@@ -176,10 +183,57 @@ async fn send_message(
 
 // GET /acp/v1/messages/pending
 async fn get_pending(State(state): State<SharedState>) -> impl IntoResponse {
+    let agent_guard = state.agent.read().await;
+    let agent = match agent_guard.as_ref() {
+        Some(a) => a,
+        None => {
+            let mut resp = Json(serde_json::json!({"messages": [], "count": 0})).into_response();
+            return with_cors(resp);
+        }
+    };
+    let messages = agent.get_all_messages().await;
     with_cors(Json(serde_json::json!({
-        "messages": [],
-        "count": 0
+        "messages": messages,
+        "count": messages.len()
     })))
+}
+
+// GET /acp/v1/debug/messages
+async fn debug_messages(State(state): State<SharedState>) -> impl IntoResponse {
+    let agent_guard = state.agent.read().await;
+    let agent = match agent_guard.as_ref() {
+        Some(a) => a,
+        None => {
+            let mut resp = Json(serde_json::json!({"messages": []})).into_response();
+            return with_cors(resp);
+        }
+    };
+    let messages = agent.get_all_messages().await;
+    with_cors(Json(serde_json::json!({ "messages": messages })))
+}
+
+// GET /acp/v1/peers
+async fn get_peers(State(state): State<SharedState>) -> impl IntoResponse {
+    let agent_guard = state.agent.read().await;
+    let agent = match agent_guard.as_ref() {
+        Some(a) => a,
+        None => {
+            let mut resp = Json(serde_json::json!({"peers": []})).into_response();
+            return with_cors(resp);
+        }
+    };
+    let peers = agent.get_peers();
+    let peers_json: Vec<serde_json::Value> = peers.into_iter().map(|p| {
+        serde_json::json!({
+            "agent_id": p.agent_id,
+            "machine_id": p.machine_id,
+            "http_endpoint": p.http_endpoint,
+            "ws_endpoint": p.ws_endpoint,
+            "capabilities": p.capabilities,
+            "last_seen_at": None::<f64>,
+        })
+    }).collect();
+    with_cors(Json(serde_json::json!({ "peers": peers_json })))
 }
 
 // POST /acp/v1/messages/{msg_id}/ack
@@ -247,6 +301,8 @@ pub fn build_router(agent: ACPAgent) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/acp/v1/debug/messages", get(debug_messages))
+        .route("/acp/v1/peers", get(get_peers))
         .route("/acp/v1/messages/send", post(send_message))
         .route("/acp/v1/messages/pending", get(get_pending))
         .route("/acp/v1/messages/{msg_id}/ack", post(ack_message))
