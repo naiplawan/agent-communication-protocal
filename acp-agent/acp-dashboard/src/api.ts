@@ -37,14 +37,14 @@ export function transformToDispatch(message: PendingMessage): Dispatch {
     const value = agentId.split('-')[0].toUpperCase();
     return ['FE', 'BE', 'QA', 'SA', 'PM', 'DEV', 'OPS'].includes(value) ? value : undefined;
   };
-  const serialized = payload ? JSON.stringify(payload) : undefined;
+  const serialized = payload ? JSON.stringify(payload, null, 2) : undefined;
   const readablePayload = typeof payload?.content === 'string'
     ? payload.content
     : typeof payload?.message === 'string'
       ? payload.message
       : typeof payload?.task === 'string'
         ? payload.task
-        : serialized;
+        : undefined;
   const intent = (envelope.intent || 'delegate') as Dispatch['intent'];
   const statusByIntent: Record<string, Dispatch['status']> = { delegate: 'dispatched', reply: 'acknowledged', ack: 'acknowledged', error: 'blocked', stream_start: 'in_progress', stream_chunk: 'in_progress', stream_end: 'verification' };
   return {
@@ -63,7 +63,7 @@ export function transformToDispatch(message: PendingMessage): Dispatch {
     last_updated: new Date().toISOString(),
     risk: (payload?.risk as Dispatch['risk']) || 'low',
     payload_preview: readablePayload && readablePayload.length > 160 ? `${readablePayload.slice(0, 160)}...` : readablePayload,
-    payload_content: readablePayload,
+    payload_content: serialized,
     deadline: envelope.deadline,
     error: envelope.error,
   };

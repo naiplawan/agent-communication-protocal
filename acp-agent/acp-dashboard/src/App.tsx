@@ -606,8 +606,11 @@ function Inbox({ data }: { data: ReturnType<typeof useData> }) {
               {selected.payload_content && (
                 <div className="detail-payload">
                   <p className="eyebrow">Payload</p>
-                  <div className="markdown-body payload-body">
-                    <Markdown remarkPlugins={[remarkGfm]}>{selected.payload_content}</Markdown>
+                  <div className="payload-body">
+                    {selected.payload_content.startsWith('{') || selected.payload_content.startsWith('[')
+                      ? <pre className="json-viewer"><code>{selected.payload_content}</code></pre>
+                      : <Markdown remarkPlugins={[remarkGfm]}>{selected.payload_content}</Markdown>
+                    }
                   </div>
                 </div>
               )}
