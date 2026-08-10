@@ -35,7 +35,7 @@ import {
   transformToAgentHealth,
   transformToDispatch,
 } from './api';
-import type { AgentHealth, CommandCenterMetrics, Dispatch } from './types';
+import type { AgentHealth, CommandCenterMetrics, Dispatch, Peer } from './types';
 import { Button } from './components/ui/button';
 
 const POLL_INTERVAL = 10_000;
@@ -61,7 +61,30 @@ function useData() {
         getPeers(),
       ]);
       const nextDispatches = messages.messages.map(transformToDispatch);
-      const nextAgents = transformToAgentHealth(peers.peers);
+
+      // Merge registered peers + agents seen in message history
+      const seenAgentIds = new Set<string>();
+      const seenMachines = new Map<string, string>(); // agent_id -> machine_id
+      for (const msg of messages.messages) {
+        if (msg.sender_agent) seenAgentIds.add(msg.sender_agent);
+        if (msg.recipient_agent) seenAgentIds.add(msg.recipient_agent);
+      }
+      for (const peer of peers.peers) {
+        seenAgentIds.add(peer.agent_id);
+        seenMachines.set(peer.agent_id, peer.machine_id);
+      }
+      const mergedPeers: Peer[] = peers.peers.concat(
+        [...seenAgentIds]
+          .filter((id) => !peers.peers.some((p) => p.agent_id === id))
+          .map((agent_id) => ({
+            agent_id,
+            machine_id: seenMachines.get(agent_id) || 'unknown',
+            http_endpoint: '',
+            capabilities: [],
+          }))
+      );
+
+      const nextAgents = transformToAgentHealth(mergedPeers);
       setRelay(health);
       setDispatches(nextDispatches);
       setAgents(nextAgents);
