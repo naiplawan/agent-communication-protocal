@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { BrowserRouter, Link, Route, Routes, useLocation } from 'react-router-dom';
+import { BrowserRouter, Link, Route, Routes, useLocation, useSearchParams } from 'react-router-dom';
 import {
   Activity,
   AlertCircle,
@@ -33,6 +33,7 @@ import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
   calculateMetrics,
+  acknowledgeMessage,
   getAllMessages,
   getHealth,
   getPeers,
@@ -50,8 +51,8 @@ const WS_OPEN_TIMEOUT = 3000;
 type RelayStatus = { status: string; agent: string; this_agent_id?: string; this_machine_id?: string };
 
 // ─── WebSocket Manager ────────────────────────────────────────────────────────
-// NOTE: The current relay does not implement a live WebSocket endpoint.
-// This hook gracefully falls back to polling mode when WebSocket is unavailable.
+// The relay exposes a live WebSocket endpoint, with polling as the fallback
+// when the endpoint is unavailable.
 
 type WsMessage = {
   type: 'message' | 'ack' | 'error' | 'presence';
@@ -291,6 +292,19 @@ function AgentAvatar({ agentId, status }: { agentId: string; status: string }) {
   return <span className={`agent-avatar ${colorClass}`}>{initial}</span>;
 }
 
+function formatRelativeTime(value?: Date | number) {
+  if (!value) return 'Not available';
+  const timestamp = value instanceof Date ? value.getTime() : value * 1000;
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (seconds < 10) return 'just now';
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
 // ─── Shell & Navigation ───────────────────────────────────────────────────────
 
 function Shell({
@@ -299,6 +313,7 @@ function Shell({
   notificationsEnabled,
   onToggleSound,
   onToggleNotifications,
+  onRefresh,
   wsConnected,
   children,
 }: {
@@ -307,6 +322,7 @@ function Shell({
   notificationsEnabled: boolean;
   onToggleSound: () => void;
   onToggleNotifications: () => void;
+  onRefresh: () => void;
   wsConnected: boolean;
   children: React.ReactNode;
 }) {
@@ -333,9 +349,9 @@ function Shell({
         </Link>
         <div className="topbar-right">
           {/* Connection status */}
-          <div className={`connection-pill ${wsConnected ? 'connection-pill--live' : 'connection-pill--offline'}`}>
+          <div className={`connection-pill ${wsConnected ? 'connection-pill--live' : 'connection-pill--polling'}`}>
             {wsConnected ? <Wifi size={12} /> : <WifiOff size={12} />}
-            <span>{wsConnected ? 'Live' : 'Reconnecting…'}</span>
+            <span>{wsConnected ? 'Live' : 'Polling'}</span>
           </div>
           <div className="relay-pill">
             <StatusDot status={online ? 'online' : 'offline'} />
@@ -353,7 +369,7 @@ function Shell({
             {notificationsEnabled ? <Bell size={15} /> : <BellOff size={15} />}
              <span>{notificationsEnabled ? 'Notify on' : 'Notify off'}</span>
            </Button>
-           <Button variant="icon" className="icon-btn" title="Refresh data">
+           <Button variant="icon" className="icon-btn" title="Refresh data" aria-label="Refresh data" onClick={onRefresh}>
              <RefreshCw size={15} />
            </Button>
         </div>
@@ -365,6 +381,7 @@ function Shell({
               key={item.to}
               className={`nav-item ${location.pathname === item.to ? 'nav-item--active' : ''}`}
               to={item.to}
+              aria-current={location.pathname === item.to ? 'page' : undefined}
             >
               {item.icon}
               <span>{item.label}</span>
@@ -444,15 +461,40 @@ function MetricCard({
 
 // ─── Dashboard / Command Center ───────────────────────────────────────────────
 
+function DashboardSkeleton() {
+  return (
+    <div className="dashboard-skeleton" aria-label="Loading dashboard" role="status">
+      <div className="skeleton-block skeleton-block--banner" />
+      <div className="skeleton-metrics">
+        {[1, 2, 3, 4].map((item) => <div key={item} className="skeleton-block" />)}
+      </div>
+      <div className="skeleton-grid">
+        <div className="skeleton-block skeleton-block--panel" />
+        <div className="skeleton-block skeleton-block--panel" />
+      </div>
+      <span>Connecting to relay…</span>
+    </div>
+  );
+}
+
 function Dashboard({ data, onAgentClick }: { data: ReturnType<typeof useData>; onAgentClick?: (a: AgentHealth) => void }) {
-  const { metrics, agents, dispatches, relay, loading, error, load } = data;
-  const recent = dispatches.slice(-8).reverse();
+  const { metrics, agents, dispatches, relay, loading, error, load, lastUpdated } = data;
+  const recent = dispatches.slice(0, 8);
+  const operational = relay.status === 'ok' && !error;
+  const attentionItems = operational && metrics ? [
+    { key: 'blocked', label: 'Blocked work', detail: 'Messages are blocked and need an owner.', count: metrics.blocked_work, tone: 'coral', to: '/inbox?filter=blocked' },
+    { key: 'contract_drift', label: 'Contract drift', detail: 'Declared and actual behavior do not match.', count: metrics.contract_drift, tone: 'coral', to: '/inbox?filter=contract_drift' },
+    { key: 'approval', label: 'Awaiting approval', detail: 'Work cannot proceed until approval is recorded.', count: metrics.awaiting_approvals, tone: 'amber', to: '/inbox?filter=approval' },
+    { key: 'evidence', label: 'Evidence gaps', detail: 'Completed work is missing fresh evidence.', count: metrics.unverified_evidence, tone: 'amber', to: '/inbox?filter=evidence' },
+    { key: 'offline', label: 'Offline agents', detail: 'Agents have not checked in recently.', count: metrics.offline_agents, tone: 'violet', to: '/agents?status=offline' },
+  ].filter((item) => item.count > 0) : [];
   const alertMetrics = metrics
     ? [
         { label: 'Blocked work', value: metrics.blocked_work, accent: 'coral' },
         { label: 'Contract drift', value: metrics.contract_drift, accent: 'coral' },
         { label: 'Offline agents', value: metrics.offline_agents, accent: 'violet' },
         { label: 'Unverified evidence', value: metrics.unverified_evidence, accent: 'amber' },
+        { label: 'Awaiting approvals', value: metrics.awaiting_approvals, accent: 'amber' },
       ].filter((m) => m.value > 0)
     : [];
 
@@ -470,16 +512,13 @@ function Dashboard({ data, onAgentClick }: { data: ReturnType<typeof useData>; o
         }
       />
       {error && (
-        <div className="alert alert--error">
+        <div className="alert alert--error" role="alert">
           <AlertCircle size={16} />
           {error}
         </div>
       )}
       {loading && !metrics ? (
-        <div className="loading-state">
-          <div className="spinner" />
-          <span>Connecting to relay…</span>
-        </div>
+        <DashboardSkeleton />
       ) : (
         <>
           {/* System health banner */}
@@ -493,6 +532,44 @@ function Dashboard({ data, onAgentClick }: { data: ReturnType<typeof useData>; o
               <p>{relay.this_agent_id ? `${relay.this_agent_id}@${relay.this_machine_id || 'unknown'}` : relay.agent || 'No identity'} · ACP v1.0</p>
             </div>
             <StatusBadge value={relay.status} />
+            <p className="health-banner-freshness" aria-live="polite">
+              {lastUpdated ? `Updated ${formatRelativeTime(lastUpdated)}` : 'Waiting for first update'}
+            </p>
+          </section>
+
+          <section className={`attention-panel panel ${attentionItems.length === 0 ? 'attention-panel--clear' : ''}`}>
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">Action required</p>
+                <h2>Needs attention</h2>
+              </div>
+              <span className="attention-count">
+                {attentionItems.length ? `${attentionItems.reduce((total, item) => total + item.count, 0)} items` : operational ? 'All clear' : 'Unavailable'}
+              </span>
+            </div>
+            {attentionItems.length ? (
+              <div className="attention-list">
+                {attentionItems.map((item) => (
+                  <Link key={item.key} className={`attention-item attention-item--${item.tone}`} to={item.to}>
+                    <span className="attention-item-icon"><AlertCircle size={16} /></span>
+                    <span className="attention-item-copy">
+                      <strong>{item.label}</strong>
+                      <small>{item.detail}</small>
+                    </span>
+                    <span className="attention-item-count">{item.count}</span>
+                    <ArrowRight size={14} className="attention-item-arrow" />
+                  </Link>
+                ))}
+              </div>
+            ) : (
+              <div className="attention-clear">
+                {operational ? <Check size={18} /> : <AlertCircle size={18} />}
+                <div>
+                  <strong>{operational ? 'Nothing needs attention' : 'Waiting for relay data'}</strong>
+                  <p>{operational ? 'The network is healthy and there are no outstanding blockers.' : 'Connect to the relay to load the operational queue.'}</p>
+                </div>
+              </div>
+            )}
           </section>
 
           {/* Metric strip */}
@@ -582,24 +659,22 @@ function AgentFeed({ agents, onAgentClick }: { agents: AgentHealth[]; onAgentCli
   return (
     <div className="agent-feed">
       {agents.map((a) => (
-        <div
+        <button
+          type="button"
           key={a.peer.agent_id}
           className="agent-feed-row agent-feed-row--clickable"
           onClick={() => onAgentClick?.(a)}
-          role="button"
-          tabIndex={0}
-          onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onAgentClick?.(a); }}
         >
           <AgentAvatar agentId={a.peer.agent_id} status={a.status} />
           <div className="agent-feed-info">
             <strong>{a.peer.agent_id}</strong>
-            <small>{a.peer.machine_id}</small>
+            <small>{a.peer.machine_id} · {formatRelativeTime(a.peer.last_seen_at)}</small>
           </div>
           <div className="agent-feed-meta">
             <StatusBadge value={a.status} />
             {a.queue_depth > 0 && <span className="queue-badge">{a.queue_depth} queued</span>}
           </div>
-        </div>
+        </button>
       ))}
     </div>
   );
@@ -608,14 +683,22 @@ function AgentFeed({ agents, onAgentClick }: { agents: AgentHealth[]; onAgentCli
 // ─── Inbox ───────────────────────────────────────────────────────────────────
 
 type FilterStatus = 'all' | Dispatch['status'];
-const STATUS_FILTERS: FilterStatus[] = ['all', 'in_progress', 'complete', 'blocked', 'dispatched', 'verification'];
+type InboxFilter = FilterStatus | 'attention' | 'contract_drift' | 'approval' | 'evidence';
+const PRIMARY_FILTERS: InboxFilter[] = ['all', 'attention', 'in_progress', 'complete', 'blocked', 'dispatched', 'verification'];
+const SECONDARY_FILTERS: InboxFilter[] = ['contract_drift', 'approval', 'evidence'];
 
 function Inbox({ data }: { data: ReturnType<typeof useData> }) {
+  const [searchParams] = useSearchParams();
   const [query, setQuery] = useState('');
-  const [statusFilter, setStatusFilter] = useState<FilterStatus>('all');
+  const [inboxFilter, setInboxFilter] = useState<InboxFilter>(() => {
+    const value = searchParams.get('filter') as InboxFilter | null;
+    return value && [...PRIMARY_FILTERS, ...SECONDARY_FILTERS].includes(value) ? value : 'all';
+  });
   const [selected, setSelected] = useState<Dispatch | null>(null);
   const [composeOpen, setComposeOpen] = useState(false);
   const [copiedId, setCopiedId] = useState(false);
+  const [acknowledging, setAcknowledging] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const filtered = useMemo(() => {
     return data.dispatches.filter((item) => {
@@ -623,10 +706,20 @@ function Inbox({ data }: { data: ReturnType<typeof useData> }) {
         `${item.from.agent_id} ${item.to.agent_id} ${item.intent} ${item.payload_preview ?? ''} ${item.status}`
           .toLowerCase()
           .includes(query.toLowerCase());
-      const matchesStatus = statusFilter === 'all' || item.status === statusFilter;
-      return matchesQuery && matchesStatus;
+      const matchesFilter = inboxFilter === 'all' ||
+        (inboxFilter === 'attention' && (
+          ['blocked', 'delivery_failed'].includes(item.status) ||
+          item.contract_status === 'drift' ||
+          item.approval_state === 'required' ||
+          ['missing', 'stale'].includes(item.evidence_status)
+        )) ||
+        (inboxFilter === 'contract_drift' && item.contract_status === 'drift') ||
+        (inboxFilter === 'approval' && item.approval_state === 'required') ||
+        (inboxFilter === 'evidence' && ['missing', 'stale'].includes(item.evidence_status)) ||
+        (['in_progress', 'complete', 'blocked', 'dispatched', 'verification'].includes(inboxFilter) && item.status === inboxFilter);
+      return matchesQuery && matchesFilter;
     });
-  }, [data.dispatches, query, statusFilter]);
+  }, [data.dispatches, inboxFilter, query]);
 
   useEffect(() => {
     if (!selected) return;
@@ -640,6 +733,21 @@ function Inbox({ data }: { data: ReturnType<typeof useData> }) {
     await navigator.clipboard.writeText(selected.dispatch_id);
     setCopiedId(true);
     window.setTimeout(() => setCopiedId(false), 1800);
+  };
+
+  const acknowledge = async () => {
+    if (!selected) return;
+    setAcknowledging(true);
+    setActionError(null);
+    try {
+      await acknowledgeMessage(selected.dispatch_id);
+      await data.load();
+      setSelected(null);
+    } catch (value) {
+      setActionError(value instanceof Error ? value.message : 'Unable to acknowledge message');
+    } finally {
+      setAcknowledging(false);
+    }
   };
 
   return (
@@ -661,6 +769,7 @@ function Inbox({ data }: { data: ReturnType<typeof useData> }) {
             <div className="search-box">
               <Search size={15} />
               <input
+                aria-label="Search messages"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search agents, intents, content…"
@@ -668,16 +777,47 @@ function Inbox({ data }: { data: ReturnType<typeof useData> }) {
               />
             </div>
           </div>
-          <div className="filter-chips">
-            {STATUS_FILTERS.map((s) => (
+          <div className="filter-toolbar">
+            <div className="filter-chips" aria-label="Message filters">
+            {PRIMARY_FILTERS.map((filter) => (
               <button
-                key={s}
-                className={`filter-chip ${statusFilter === s ? 'filter-chip--active' : ''}`}
-                onClick={() => setStatusFilter(s)}
+                key={filter}
+                className={`filter-chip ${inboxFilter === filter ? 'filter-chip--active' : ''}`}
+                aria-pressed={inboxFilter === filter}
+                onClick={() => setInboxFilter(filter)}
               >
-                {s === 'all' ? 'All' : STATUS_CONFIG[s]?.label ?? s}
+                {filter === 'all' ? 'All' : filter === 'attention' ? 'Needs attention' : STATUS_CONFIG[filter]?.label ?? filter}
               </button>
             ))}
+            </div>
+            <select
+              className="filter-select filter-select--secondary"
+              aria-label="More message filters"
+              value={SECONDARY_FILTERS.includes(inboxFilter) ? inboxFilter : ''}
+              onChange={(event) => setInboxFilter((event.target.value || 'all') as InboxFilter)}
+            >
+              <option value="">More filters</option>
+              <option value="contract_drift">Contract drift</option>
+              <option value="approval">Awaiting approval</option>
+              <option value="evidence">Evidence gaps</option>
+            </select>
+            <select
+              className="filter-select filter-select--mobile"
+              aria-label="Filter messages"
+              value={inboxFilter}
+              onChange={(event) => setInboxFilter(event.target.value as InboxFilter)}
+            >
+              <option value="all">All</option>
+              <option value="attention">Needs attention</option>
+              <option value="in_progress">Running</option>
+              <option value="complete">Complete</option>
+              <option value="blocked">Blocked</option>
+              <option value="dispatched">Sent</option>
+              <option value="verification">Verify</option>
+              <option value="contract_drift">Contract drift</option>
+              <option value="approval">Awaiting approval</option>
+              <option value="evidence">Evidence gaps</option>
+            </select>
           </div>
           <div className="message-list">
             {data.loading ? (
@@ -725,24 +865,31 @@ function Inbox({ data }: { data: ReturnType<typeof useData> }) {
           onMouseDown={(e) => { if (selected && e.target === e.currentTarget) setSelected(null); }}
         >
           {selected ? (
-            <div className="panel detail-panel">
+            <div className="panel detail-panel" role="dialog" aria-modal="true" aria-labelledby="message-detail-title">
               <div className="detail-header">
                 <div>
                   <p className="eyebrow">Message detail</p>
-                  <h2>{selected.intent} message</h2>
+                  <h2 id="message-detail-title">{selected.intent} message</h2>
                 </div>
-                <button className="icon-btn icon-btn--ghost" onClick={() => setSelected(null)}>
+                <button className="icon-btn icon-btn--ghost" aria-label="Close message details" onClick={() => setSelected(null)}>
                   <X size={16} />
                 </button>
               </div>
               <div className="detail-meta">
                 <StatusBadge value={selected.status} />
                 <code className="detail-id">{selected.dispatch_id}</code>
+                {['dispatched', 'accepted'].includes(selected.status) && (
+                  <button className="btn btn--primary btn--sm" onClick={() => void acknowledge()} disabled={acknowledging}>
+                    <Check size={12} />
+                    {acknowledging ? 'Acknowledging…' : 'Acknowledge'}
+                  </button>
+                )}
                 <button className="btn btn--ghost btn--sm" onClick={copyId}>
                   {copiedId ? <Check size={12} /> : <Clipboard size={12} />}
                   {copiedId ? 'Copied' : 'Copy ID'}
                 </button>
               </div>
+              {actionError && <div className="detail-action-error" role="alert">{actionError}</div>}
               <div className="detail-routes">
                 <div className="detail-route-item">
                   <span className="detail-route-label">From</span>
@@ -822,16 +969,19 @@ function Inbox({ data }: { data: ReturnType<typeof useData> }) {
 // ─── Agents Page ─────────────────────────────────────────────────────────────
 
 function Agents({ data, onAgentClick }: { data: ReturnType<typeof useData>; onAgentClick?: (a: AgentHealth) => void }) {
+  const [searchParams] = useSearchParams();
   const { agents, loading } = data;
   const online = agents.filter((a) => a.status === 'online');
   const offline = agents.filter((a) => a.status === 'offline');
+  const statusFilter = searchParams.get('status');
+  const visibleAgents = statusFilter === 'offline' ? offline : statusFilter === 'online' ? online : agents;
 
   return (
     <div className="page">
       <PageHeader
         eyebrow="Network"
         title="Agents"
-        description={`${agents.length} registered agent${agents.length !== 1 ? 's' : ''} — ${online.length} online, ${offline.length} offline.`}
+        description={`${visibleAgents.length} shown of ${agents.length} registered — ${online.length} online, ${offline.length} offline${statusFilter ? ` · filtered to ${statusFilter}` : ''}.`}
         actions={
           <button className="btn btn--ghost" onClick={() => void data.load()}>
             <RefreshCw size={14} /> Refresh
@@ -843,30 +993,28 @@ function Agents({ data, onAgentClick }: { data: ReturnType<typeof useData>; onAg
           <div className="spinner" />
           <span>Loading agents…</span>
         </div>
-      ) : agents.length === 0 ? (
+      ) : visibleAgents.length === 0 ? (
         <div className="panel">
           <div className="empty-state">
             <Server size={36} />
-            <h3>No agents found</h3>
-            <p>Agents will appear here once they connect to the relay.</p>
+            <h3>{statusFilter ? `No ${statusFilter} agents` : 'No agents found'}</h3>
+            <p>{statusFilter ? 'Try clearing the current agent filter.' : 'Agents will appear here once they connect to the relay.'}</p>
           </div>
         </div>
       ) : (
         <div className="agents-grid">
-          {agents.map((a) => (
-            <div
+          {visibleAgents.map((a) => (
+            <button
+              type="button"
               key={a.peer.agent_id}
               className={`agent-card ${a.status === 'offline' ? 'agent-card--offline' : ''}`}
               onClick={() => onAgentClick?.(a)}
-              role="button"
-              tabIndex={0}
-              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onAgentClick?.(a); }}
             >
               <div className="agent-card-header">
                 <AgentAvatar agentId={a.peer.agent_id} status={a.status} />
                 <div className="agent-card-info">
                   <strong>{a.peer.agent_id}</strong>
-                  <small>{a.peer.machine_id}</small>
+                  <small>{a.peer.machine_id} · last seen {formatRelativeTime(a.peer.last_seen_at)}</small>
                 </div>
                 <StatusBadge value={a.status} />
               </div>
@@ -897,7 +1045,7 @@ function Agents({ data, onAgentClick }: { data: ReturnType<typeof useData>; onAg
                   </div>
                 </div>
               </div>
-            </div>
+            </button>
           ))}
         </div>
       )}
@@ -1132,7 +1280,7 @@ function AgentDetailModal({
       role="presentation"
       onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
-      <section className="agent-detail-modal" role="dialog" aria-modal="true">
+      <section className="agent-detail-modal" role="dialog" aria-modal="true" aria-labelledby="agent-title">
         <div className="modal-header">
           <div className="agent-detail-header">
             <AgentAvatar agentId={agent.peer.agent_id} status={agent.status} />
@@ -1402,6 +1550,7 @@ function App() {
   );
   const [composeRecipient, setComposeRecipient] = useState<string | null>(null);
   const [detailAgent, setDetailAgent] = useState<AgentHealth | null>(null);
+  const [announcement, setAnnouncement] = useState('');
   const audioContext = useRef<AudioContext | null>(null);
   const seenMessages = useRef<Set<string> | null>(null);
 
@@ -1426,6 +1575,7 @@ function App() {
   };
 
   const handleNewMessage = (dispatch: Dispatch) => {
+    setAnnouncement(`New ${dispatch.intent} message from ${dispatch.from.agent_id}`);
     if (soundEnabled) playSound();
     if (notificationsEnabled) {
       notify(
@@ -1471,12 +1621,14 @@ function App() {
 
   return (
     <BrowserRouter>
+      <div className="sr-only" aria-live="polite" aria-atomic="true">{announcement}</div>
       <Shell
         relay={data.relay}
         soundEnabled={soundEnabled}
         notificationsEnabled={notificationsEnabled}
         onToggleSound={toggleSound}
         onToggleNotifications={toggleNotifications}
+        onRefresh={() => void data.load()}
         wsConnected={data.wsConnected}
       >
         <Routes>

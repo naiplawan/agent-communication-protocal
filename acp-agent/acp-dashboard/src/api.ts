@@ -4,7 +4,7 @@ const API_BASE = import.meta.env.VITE_RELAY_URL || '/api/relay';
 
 async function fetchJson<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, { headers: { Accept: 'application/json' } });
-  if (!response.ok) throw new Error(`Relay API error: ${response.status} ${response.statusText}`);
+  if (!response.ok) throw new Error(apiError(response));
   return response.json() as Promise<T>;
 }
 
@@ -14,14 +14,23 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
     headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  if (!response.ok) throw new Error(`Relay API error: ${response.status} ${response.statusText}`);
+  if (!response.ok) throw new Error(apiError(response));
   return response.json() as Promise<T>;
+}
+
+function apiError(response: Response) {
+  if (response.status === 401) return 'Relay authentication failed. Check ACP_SHARED_SECRET and dashboard relay configuration.';
+  if (response.status === 403) return 'Relay access was denied. Check the dashboard token audience and permissions.';
+  if (response.status >= 500) return 'Relay is unavailable. Check the relay container and try again.';
+  return `Relay API error: ${response.status} ${response.statusText}`;
 }
 
 export const getHealth = () => fetchJson<{ status: string; agent: string }>('/health');
 export const getAllMessages = () => fetchJson<{ messages: PendingMessage[] }>('/acp/v1/debug/messages');
 export const getPeers = () => fetchJson<{ peers: Peer[] }>('/acp/v1/peers');
 export const sendMessage = (envelope: unknown, payload: unknown) => postJson<{ msg_id: string; status: string }>('/acp/v1/messages/send', { envelope, payload });
+export const acknowledgeMessage = (msgId: string) =>
+  postJson<{ msg_id: string; status: string }>(`/acp/v1/messages/${encodeURIComponent(msgId)}/ack`, { processed: false });
 
 export function transformToDispatch(message: PendingMessage): Dispatch {
   const envelope = message.envelope || {
@@ -47,6 +56,25 @@ export function transformToDispatch(message: PendingMessage): Dispatch {
         : undefined;
   const intent = (envelope.intent || 'delegate') as Dispatch['intent'];
   const statusByIntent: Record<string, Dispatch['status']> = { delegate: 'dispatched', reply: 'acknowledged', ack: 'acknowledged', error: 'blocked', stream_start: 'in_progress', stream_chunk: 'in_progress', stream_end: 'verification' };
+  const statusByRelayState: Record<string, Dispatch['status']> = {
+    pending: 'dispatched',
+    forwarded: 'dispatched',
+    brokered: 'accepted',
+    accepted: 'accepted',
+    delivered: 'acknowledged',
+    received: 'acknowledged',
+    acknowledged: 'acknowledged',
+    complete: 'complete',
+    blocked: 'blocked',
+    delivery_failed: 'delivery_failed',
+  };
+  const rawStatus = message.status?.toLowerCase();
+  const lastUpdated = message.updated_at ?? message.received_at ?? message.created_at;
+  const timestamp = typeof lastUpdated === 'number'
+    ? new Date(lastUpdated < 1_000_000_000_000 ? lastUpdated * 1000 : lastUpdated)
+    : lastUpdated
+      ? new Date(lastUpdated)
+      : new Date();
   return {
     dispatch_id: envelope.msg_id,
     correlation_id: envelope.corr_id || envelope.msg_id,
@@ -54,13 +82,13 @@ export function transformToDispatch(message: PendingMessage): Dispatch {
     intent,
     from: { agent_id: envelope.sender.agent_id, role: role(envelope.sender.agent_id), machine_id: envelope.sender.machine_id || 'unknown' },
     to: { agent_id: envelope.recipient.agent_id, role: role(envelope.recipient.agent_id), machine_id: envelope.recipient.machine_id || 'unknown' },
-    status: statusByIntent[intent] || 'dispatched',
+    status: (rawStatus && statusByRelayState[rawStatus]) || statusByIntent[intent] || 'dispatched',
     evidence_status: (payload?.evidence_status as Dispatch['evidence_status']) || 'missing',
     contract_status: (payload?.contract_status as Dispatch['contract_status']) || 'not_checked',
     approval_state: (payload?.approval_state as Dispatch['approval_state']) || 'pending',
     required_approvals: (payload?.required_approvals as string[]) || [],
     received_approvals: (payload?.received_approvals as string[]) || [],
-    last_updated: new Date().toISOString(),
+    last_updated: Number.isNaN(timestamp.getTime()) ? new Date().toISOString() : timestamp.toISOString(),
     risk: (payload?.risk as Dispatch['risk']) || 'low',
     payload_preview: readablePayload && readablePayload.length > 160 ? `${readablePayload.slice(0, 160)}...` : readablePayload,
     payload_content: serialized,

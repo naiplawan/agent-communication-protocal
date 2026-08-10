@@ -41,6 +41,9 @@ export interface PendingMessage {
   intent?: string;
   status?: string;
   error?: string;
+  created_at?: string | number;
+  updated_at?: string | number;
+  received_at?: string | number;
 }
 
 // Dashboard Types
