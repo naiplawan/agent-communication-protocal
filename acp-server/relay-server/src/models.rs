@@ -146,6 +146,14 @@ pub struct Peer {
     pub capabilities: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<f64>,
+    /// False once a push to `http_endpoint` has failed. Poll-only agents live
+    /// here permanently; it suppresses the forward attempt, not the peer.
+    #[serde(default = "default_reachable")]
+    pub reachable: bool,
+}
+
+fn default_reachable() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]

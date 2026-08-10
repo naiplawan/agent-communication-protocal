@@ -24,6 +24,9 @@ impl Store {
     pub fn new(db_path: &Path) -> SqlResult<Self> {
         let conn = Connection::open(db_path)?;
         conn.execute_batch(SCHEMA)?;
+        // Added after the first release; existing databases predate the column.
+        conn.execute("ALTER TABLE peer_registry ADD COLUMN reachable INTEGER NOT NULL DEFAULT 1", [])
+            .ok();
         Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
@@ -150,14 +153,15 @@ impl Store {
         conn.execute(
             r#"INSERT INTO peer_registry
                (agent_id, machine_id, http_endpoint, ws_endpoint,
-                capabilities_json, last_seen_at, registered_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
+                capabilities_json, last_seen_at, registered_at, reachable)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 1)
                ON CONFLICT(agent_id) DO UPDATE SET
                    machine_id = excluded.machine_id,
                    http_endpoint = excluded.http_endpoint,
                    ws_endpoint = excluded.ws_endpoint,
                    capabilities_json = excluded.capabilities_json,
-                   last_seen_at = excluded.last_seen_at"#,
+                   last_seen_at = excluded.last_seen_at,
+                   reachable = 1"#,
             params![
                 peer.agent_id, peer.machine_id, peer.http_endpoint,
                 peer.ws_endpoint.as_deref().unwrap_or(""),
@@ -185,6 +189,19 @@ impl Store {
     pub fn remove_peer(&self, agent_id: &str) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM peer_registry WHERE agent_id = ?", params![agent_id])?;
+        Ok(())
+    }
+
+    /// Record that a push to this peer's `http_endpoint` failed. The peer stays
+    /// registered — it may well be a poll-only agent that never accepts pushes —
+    /// so the relay just stops paying the forward timeout and brokers instead.
+    /// Registering again clears the flag.
+    pub fn mark_peer_unreachable(&self, agent_id: &str) -> SqlResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE peer_registry SET reachable = 0 WHERE agent_id = ?",
+            params![agent_id],
+        )?;
         Ok(())
     }
 
@@ -219,6 +236,7 @@ fn peer_row_map(row: &rusqlite::Row) -> rusqlite::Result<Peer> {
         ws_endpoint: ws_endpoint.filter(|s| !s.is_empty()),
         capabilities,
         last_seen_at: row.get("last_seen_at").ok(),
+        reachable: row.get::<_, i64>("reachable").map(|v| v != 0).unwrap_or(true),
     })
 }
 

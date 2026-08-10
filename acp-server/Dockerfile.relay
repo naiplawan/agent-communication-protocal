@@ -15,7 +15,10 @@
 #     acp-relay
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM rust:1.93-slim AS builder
+# Pinned to bookworm to match the runtime stage below: the floating
+# `rust:1.93-slim` tag now resolves to Debian 13 (trixie), whose OpenSSL 3.5 and
+# glibc 2.41 the bookworm runtime does not have.
+FROM rust:1.93-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*

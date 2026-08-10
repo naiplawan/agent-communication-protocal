@@ -162,7 +162,12 @@ pub async fn send_message(
 
     // Try dynamic peer lookup (active peers only)
     let peers = state.store.get_peers(false).unwrap_or_default();
-    let recipient_config = peers.iter().find(|p| p.agent_id == *recipient_agent);
+    // A peer whose endpoint has already failed a push is left registered but is
+    // no longer a forward target, so poll-only agents don't cost a timeout per
+    // message. They collect the same message from the broker instead.
+    let recipient_config = peers
+        .iter()
+        .find(|p| p.agent_id == *recipient_agent && p.reachable);
 
     if recipient_config.is_none() {
         // Broker mode
@@ -225,8 +230,8 @@ pub async fn send_message(
                 || err_str.contains("connection reset") || err_str.contains("error sending request")
                 || err_str.contains("Connection timed out") || err_str.contains("connect)")
             {
-                state.store.remove_peer(recipient_agent).ok();
-                warn!("[SEND] Removed stale peer {} - re-brokering", recipient_agent);
+                state.store.mark_peer_unreachable(recipient_agent).ok();
+                warn!("[SEND] Peer {} unreachable - re-brokering", recipient_agent);
                 state.store.put(msg_id, envelope, &body.payload).ok();
                 return with_cors(send_ok(msg_id, "brokered", None));
             }
@@ -249,6 +254,9 @@ pub async fn get_pending(
         return forbidden(e);
     }
     let agent_id = agent_id_from_iss(&claims.iss);
+    // Polling is the liveness signal for agents that don't accept pushes; without
+    // this their last_seen_at only moves on re-registration and they read as stale.
+    state.store.touch_peer(&agent_id).ok();
     let messages = state.store.get_all_pending(&agent_id).unwrap_or_default();
     info!("[PENDING] {} messages for {}", messages.len(), agent_id);
     with_cors(Json(serde_json::json!({ "messages": messages, "count": messages.len() })))

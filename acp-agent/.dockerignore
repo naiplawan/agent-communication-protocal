@@ -1,0 +1,11 @@
+# The build only needs Cargo.toml, Cargo.lock, acp-core/, acp-agent/ and
+# acp-peers.yaml. Everything below is context the daemon would otherwise tar up
+# on every build — target/ alone is ~2.7 GB.
+**/target/
+acp-dashboard/
+llm-agent/
+**/node_modules/
+.git/
+.env
+.env.*
+*.md
