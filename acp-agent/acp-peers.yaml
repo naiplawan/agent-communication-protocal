@@ -11,7 +11,7 @@ this_agent:
 peers:
   - agent_id: acp-relay
     machine_id: relay
-    http_endpoint: http://localhost:8443
+    http_endpoint: http://172.20.29.86:8443
     capabilities:
       - relay
       - registry

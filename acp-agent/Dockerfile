@@ -1,6 +1,3 @@
-# Requires BuildKit for the cache mounts below: `docker compose build`, or
-# `DOCKER_BUILDKIT=1 docker build .`
-#
 # The builder is pinned to bookworm to match the runtime stage. The floating
 # `rust:1.93-slim` tag now resolves to Debian 13 (trixie), which would link the
 # binary against OpenSSL 3.5 and glibc 2.41 — neither of which bookworm has.
@@ -15,12 +12,9 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY acp-core ./acp-core
 COPY acp-agent ./acp-agent
-# The registry and target caches survive between builds, so editing a source file
-# recompiles that crate rather than the whole dependency tree. target/ is a cache
-# mount and so is not part of the layer — the binary has to be copied out here.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo build --release -p acp-agent && \
+# Avoid BuildKit-only cache mounts so this image builds with a standard Docker
+# installation as well.
+RUN cargo build --release -p acp-agent && \
     cp /build/target/release/acp-agent /usr/local/bin/acp-agent
 
 FROM debian:bookworm-slim
