@@ -1,4 +1,4 @@
-import type { AgentHealth, CommandCenterMetrics, Dispatch, DispatchFilters, PendingMessage, Peer } from './types';
+import type { AgentHealth, CommandCenterMetrics, Dispatch, DispatchFilters, MessageAttachment, PendingMessage, Peer } from './types';
 
 const API_BASE = import.meta.env.VITE_RELAY_URL || '/api/relay';
 
@@ -37,6 +37,38 @@ export const sendMessage = (envelope: unknown, payload: unknown) => postJson<{ m
 export const acknowledgeMessage = (msgId: string) =>
   postJson<{ msg_id: string; status: string }>(`/acp/v1/messages/${encodeURIComponent(msgId)}/ack`, { processed: false });
 
+const MIME_TYPES: Record<string, string> = {
+  '7z': 'application/x-7z-compressed',
+  csv: 'text/csv',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  gif: 'image/gif',
+  gz: 'application/gzip',
+  jpeg: 'image/jpeg',
+  jpg: 'image/jpeg',
+  json: 'application/json',
+  mp3: 'audio/mpeg',
+  mp4: 'video/mp4',
+  pdf: 'application/pdf',
+  png: 'image/png',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  tar: 'application/x-tar',
+  txt: 'text/plain',
+  wav: 'audio/wav',
+  webm: 'video/webm',
+  webp: 'image/webp',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  xml: 'application/xml',
+  zip: 'application/zip',
+};
+
+function mimeTypeFor(name: string) {
+  const extension = name.split('.').pop()?.toLowerCase() || '';
+  return MIME_TYPES[extension] || 'application/octet-stream';
+}
+
 export function transformToDispatch(message: PendingMessage): Dispatch {
   const envelope = message.envelope || {
     msg_id: message.msg_id || 'unknown',
@@ -52,6 +84,30 @@ export function transformToDispatch(message: PendingMessage): Dispatch {
     return ['FE', 'BE', 'QA', 'SA', 'PM', 'DEV', 'OPS'].includes(value) ? value : undefined;
   };
   const serialized = payload ? JSON.stringify(payload, null, 2) : undefined;
+  const rawAttachment = payload?.attachment;
+  const attachmentRecord = rawAttachment && typeof rawAttachment === 'object'
+    ? rawAttachment as Record<string, unknown>
+    : undefined;
+  const attachmentName = typeof attachmentRecord?.name === 'string'
+    ? attachmentRecord.name
+    : typeof attachmentRecord?.filename === 'string'
+      ? attachmentRecord.filename
+      : 'attachment';
+  const attachmentData = [attachmentRecord?.data, attachmentRecord?.url, attachmentRecord?.base64, attachmentRecord?.content]
+    .find((value): value is string => typeof value === 'string' && value.length > 0);
+  const attachment: MessageAttachment | undefined = attachmentRecord
+    && typeof attachmentData === 'string'
+    ? {
+      name: attachmentName,
+      type: typeof attachmentRecord.type === 'string'
+        ? attachmentRecord.type
+        : typeof attachmentRecord.mime_type === 'string'
+          ? attachmentRecord.mime_type
+          : mimeTypeFor(attachmentName),
+      size: typeof attachmentRecord.size === 'number' ? attachmentRecord.size : 0,
+      data: attachmentData,
+    }
+    : undefined;
   const readablePayload = typeof payload?.content === 'string'
     ? payload.content
     : typeof payload?.message === 'string'
@@ -97,6 +153,7 @@ export function transformToDispatch(message: PendingMessage): Dispatch {
     risk: (payload?.risk as Dispatch['risk']) || 'low',
     payload_preview: readablePayload && readablePayload.length > 160 ? `${readablePayload.slice(0, 160)}...` : readablePayload,
     payload_content: serialized,
+    attachment,
     deadline: envelope.deadline,
     error: envelope.error,
   };

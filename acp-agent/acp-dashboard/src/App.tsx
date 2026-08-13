@@ -48,7 +48,7 @@ import {
   transformToAgentHealth,
   transformToDispatch,
 } from './api';
-import type { AgentHealth, CommandCenterMetrics, Dispatch, Peer, PendingMessage } from './types';
+import type { AgentHealth, CommandCenterMetrics, Dispatch, MessageAttachment, Peer, PendingMessage } from './types';
 import { Button } from './components/ui/button';
 
 const POLL_INTERVAL = 10_000;
@@ -322,6 +322,13 @@ function formatRelativeTime(value?: Date | number) {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours}h ago`;
   return `${Math.floor(hours / 24)}d ago`;
+}
+
+function attachmentUrl(attachment: MessageAttachment) {
+  const value = attachment.data.trim();
+  if (/^(data|blob|https?):/i.test(value)) return value;
+  const base64 = value.startsWith('base64,') ? value.slice(7) : value;
+  return `data:${attachment.type || 'application/octet-stream'};base64,${base64.replace(/\s/g, '')}`;
 }
 
 // ─── Shell & Navigation ───────────────────────────────────────────────────────
@@ -1196,6 +1203,28 @@ function Inbox({ data }: { data: ReturnType<typeof useData> }) {
                   <StatusBadge value={selected.contract_status} />
                 </div>
               </div>
+              {selected.attachment && (
+                <div className="detail-payload">
+                  <p className="eyebrow">Attachment</p>
+                  <div className="attachment-card">
+                    <div className="attachment-copy">
+                      <Hash size={16} />
+                      <div>
+                        <strong>{selected.attachment.name}</strong>
+                        <small>{selected.attachment.type} · {selected.attachment.size ? `${(selected.attachment.size / 1024).toFixed(0)} KB` : 'size unknown'}</small>
+                      </div>
+                    </div>
+                    <div className="attachment-actions">
+                      <a className="btn btn--primary btn--sm" href={attachmentUrl(selected.attachment)} target="_blank" rel="noreferrer">
+                        <ExternalLink size={13} /> Open
+                      </a>
+                      <a className="btn btn--ghost btn--sm" href={attachmentUrl(selected.attachment)} download={selected.attachment.name}>
+                        <Download size={13} /> Download
+                      </a>
+                    </div>
+                  </div>
+                </div>
+              )}
               {selected.payload_content && (
                 <div className="detail-payload">
                   <p className="eyebrow">Payload</p>
@@ -1691,7 +1720,7 @@ function ComposeModal({
       origin: sender,
       sender,
       recipient: { agent_id: recipient.trim(), machine_id: thisMachineId },
-      reply_to: [`${thisAgentId}@${thisMachineId}`],
+      reply_to: { path: [`${thisAgentId}@${thisMachineId}`] },
       hops: { count: 0, max: 10, trace: [] },
       intent: 'delegate',
       content_type: 'application/json',
@@ -1980,7 +2009,7 @@ function ComposeModalWrapper({
       origin: sender,
       sender,
       recipient: { agent_id: recipient.trim(), machine_id: thisMachineId },
-      reply_to: [`${thisAgentId}@${thisMachineId}`],
+      reply_to: { path: [`${thisAgentId}@${thisMachineId}`] },
       hops: { count: 0, max: 10, trace: [] },
       intent: 'delegate',
       content_type: 'application/json',

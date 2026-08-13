@@ -75,6 +75,13 @@ export type ContractStatus = 'match' | 'drift' | 'missing' | 'not_checked';
 export type ApprovalState = 'required' | 'approved' | 'declined' | 'pending';
 export type Risk = 'low' | 'medium' | 'high';
 
+export interface MessageAttachment {
+  name: string;
+  type: string;
+  size: number;
+  data: string;
+}
+
 export interface Dispatch {
   dispatch_id: string;
   correlation_id: string;
@@ -100,6 +107,7 @@ export interface Dispatch {
   risk: Risk;
   payload_preview?: string;
   payload_content?: string;
+  attachment?: MessageAttachment;
   deadline?: string;
   error?: string;
 }

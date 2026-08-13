@@ -351,6 +351,13 @@ h2 { font-family: var(--font-display); font-size: 18px; font-weight: 700; letter
 .payload-body { margin-top: 10px; padding: 16px; background: var(--bg-base); border: 1px solid var(--border-subtle); border-radius: var(--radius); font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; }
 .json-viewer { margin: 0; padding: 12px; background: var(--bg-inset); border-radius: var(--radius); overflow-x: auto; white-space: pre; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 12px; line-height: 1.6; }
 .json-viewer code { color: var(--text); }
+.attachment-card { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 14px; background: var(--bg-inset); border: 1px solid var(--border-subtle); border-radius: var(--radius); }
+.attachment-copy { display: flex; align-items: center; gap: 10px; min-width: 0; color: var(--teal); }
+.attachment-copy > div { display: grid; gap: 3px; min-width: 0; }
+.attachment-copy strong { color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-copy small { color: var(--text-muted); font-size: 11px; }
+.attachment-actions { display: flex; gap: 8px; flex-shrink: 0; }
+@media (max-width: 620px) { .attachment-card { align-items: flex-start; flex-direction: column; } .attachment-actions { width: 100%; } }
 
 /* ─── Agents Grid ───────────────────────────────────────────────────────── */
 .agents-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
