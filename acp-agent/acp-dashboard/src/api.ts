@@ -25,7 +25,12 @@ function apiError(response: Response) {
   return `Relay API error: ${response.status} ${response.statusText}`;
 }
 
-export const getHealth = () => fetchJson<{ status: string; agent: string }>('/health');
+export const getHealth = () => fetchJson<{
+  status: string;
+  agent: string;
+  this_agent_id?: string;
+  this_machine_id?: string;
+}>('/health');
 export const getAllMessages = () => fetchJson<{ messages: PendingMessage[] }>('/acp/v1/debug/messages');
 export const getPeers = () => fetchJson<{ peers: Peer[] }>('/acp/v1/peers');
 export const sendMessage = (envelope: unknown, payload: unknown) => postJson<{ msg_id: string; status: string }>('/acp/v1/messages/send', { envelope, payload });

@@ -7,14 +7,20 @@ import {
   Bell,
   BellOff,
   Check,
+  CheckCircle2,
   ChevronRight,
+  Clock3,
   Circle,
   Clipboard,
+  Copy,
+  Cpu,
   Download,
+  ExternalLink,
   Globe,
   Hash,
   Inbox as InboxIcon,
   MessageSquare,
+  Radio,
   RefreshCw,
   Search,
   Send,
@@ -22,6 +28,7 @@ import {
   Settings2,
   ShieldCheck,
   SlidersHorizontal,
+  Target,
   Volume2,
   VolumeX,
   Wifi,
@@ -166,6 +173,13 @@ function useData(opts: { onNewMessage?: (d: Dispatch) => void } = {}) {
         getPeers(),
       ]);
       const nextDispatches = messages.messages.map(transformToDispatch);
+      const relayAgentId = health.agent || 'acp-relay';
+      const isRelayDashboard = !health.this_agent_id;
+      const isRelayPeer = (peer: Peer) =>
+        peer.agent_id === relayAgentId ||
+        peer.agent_id === 'acp-relay' ||
+        peer.machine_id === 'relay' ||
+        peer.capabilities?.includes('relay') === true;
 
       // Merge registered peers + agents seen in message history
       const seenAgentIds = new Set<string>();
@@ -175,12 +189,17 @@ function useData(opts: { onNewMessage?: (d: Dispatch) => void } = {}) {
         if (msg.recipient_agent) seenAgentIds.add(msg.recipient_agent);
       }
       for (const peer of peers.peers) {
-        seenAgentIds.add(peer.agent_id);
-        seenMachines.set(peer.agent_id, peer.machine_id);
+        if (!isRelayDashboard || !isRelayPeer(peer)) {
+          seenAgentIds.add(peer.agent_id);
+          seenMachines.set(peer.agent_id, peer.machine_id);
+        }
       }
-      const mergedPeers: Peer[] = peers.peers.concat(
+      const visiblePeers = isRelayDashboard
+        ? peers.peers.filter((peer) => !isRelayPeer(peer))
+        : peers.peers;
+      const mergedPeers: Peer[] = visiblePeers.concat(
         [...seenAgentIds]
-          .filter((id) => !peers.peers.some((p) => p.agent_id === id))
+          .filter((id) => !visiblePeers.some((p) => p.agent_id === id))
           .map((agent_id) => ({
             agent_id,
             machine_id: seenMachines.get(agent_id) || 'unknown',
@@ -330,10 +349,10 @@ function Shell({
   const online = relay.status === 'ok';
   const isAgent = !!relay.this_agent_id;
   const navItems = [
-    { to: '/', icon: <SlidersHorizontal size={16} />, label: 'Dashboard' },
-    { to: '/inbox', icon: <InboxIcon size={16} />, label: 'Inbox', live: online },
-    { to: '/agents', icon: <Server size={16} />, label: 'Agents' },
-    { to: '/setup', icon: <Settings2 size={16} />, label: 'Setup' },
+    { to: '/', icon: <SlidersHorizontal size={16} />, label: isAgent ? 'Workspace' : 'Overview' },
+    { to: '/inbox', icon: <InboxIcon size={16} />, label: isAgent ? 'Inbox' : 'Traffic', live: online },
+    { to: '/agents', icon: <Server size={16} />, label: isAgent ? 'Connections' : 'Peers' },
+    { to: '/setup', icon: <Settings2 size={16} />, label: isAgent ? 'Agent setup' : 'Connect' },
   ];
   return (
     <div className="app-shell">
@@ -345,7 +364,7 @@ function Shell({
           </span>
           <span className="brand-name">ACP</span>
           <span className="brand-divider" />
-          <span className="brand-sub">Control Plane</span>
+          <span className="brand-sub">{isAgent ? 'Agent Workspace' : 'Relay Console'}</span>
         </Link>
         <div className="topbar-right">
           {/* Connection status */}
@@ -627,6 +646,254 @@ function Dashboard({ data, onAgentClick }: { data: ReturnType<typeof useData>; o
               )}
             </section>
           </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// Keep the original command-center implementation available for future
+// per-agent views while the root route uses the relay-specific console below.
+void Dashboard;
+
+// ─── Relay Overview ──────────────────────────────────────────────────────────
+
+function RelayDashboard({ data }: { data: ReturnType<typeof useData> }) {
+  const { relay, dispatches, agents, loading, error, lastUpdated, load } = data;
+  const operational = relay.status === 'ok' && !error;
+  const onlineAgents = agents.filter((agent) => agent.status === 'online');
+  const queued = dispatches.filter((dispatch) => ['dispatched', 'accepted'].includes(dispatch.status));
+  const failed = dispatches.filter((dispatch) => ['blocked', 'delivery_failed'].includes(dispatch.status));
+  const endpoint = import.meta.env.VITE_RELAY_URL || 'http://localhost:8443';
+
+  const traffic = useMemo(() => {
+    const buckets = Array.from({ length: 12 }, (_, index) => ({
+      label: `${11 - index}h`,
+      count: 0,
+    }));
+    const now = lastUpdated?.getTime() ?? 0;
+    dispatches.forEach((dispatch) => {
+      const age = Math.floor((now - new Date(dispatch.last_updated).getTime()) / 3_600_000);
+      if (age >= 0 && age < 12) buckets[11 - age].count += 1;
+    });
+    return buckets;
+  }, [dispatches, lastUpdated]);
+  const maxTraffic = Math.max(1, ...traffic.map((bucket) => bucket.count));
+  const recent = dispatches.slice(0, 6);
+
+  const copyEndpoint = async () => {
+    await navigator.clipboard.writeText(endpoint);
+  };
+
+  return (
+    <div className="page relay-page">
+      <PageHeader
+        eyebrow="Relay / acp-relay"
+        title="Message traffic, at a glance."
+        description="A focused control room for the broker, connected peers, and every route moving through your ACP relay."
+        actions={
+          <>
+            <Link className="btn btn--ghost" to="/inbox"><InboxIcon size={14} /> View traffic</Link>
+            <Button onClick={() => void load()}><RefreshCw size={14} /> Refresh</Button>
+          </>
+        }
+      />
+
+      {error && (
+        <div className="alert alert--error" role="alert">
+          <AlertCircle size={16} /> {error}
+        </div>
+      )}
+
+      {loading && !lastUpdated ? (
+        <DashboardSkeleton />
+      ) : (
+        <>
+          <section className={`relay-hero ${operational ? 'relay-hero--online' : 'relay-hero--offline'}`}>
+            <div className="relay-hero-orbit" aria-hidden="true">
+              <span className="orbit-ring orbit-ring--outer" />
+              <span className="orbit-ring orbit-ring--inner" />
+              <span className="orbit-core"><Radio size={25} /></span>
+            </div>
+            <div className="relay-hero-copy">
+              <div className="relay-hero-kicker"><span className="status-dot status-dot--teal" /> Relay status</div>
+              <h2>{operational ? 'Operational and accepting traffic' : 'Relay connection needs attention'}</h2>
+              <p>{operational ? 'Messages can be forwarded to reachable peers or held safely in the broker.' : 'Check the container and shared secret, then refresh this view.'}</p>
+              <div className="relay-hero-meta">
+                <span><ShieldCheck size={14} /> Signed-token auth</span>
+                <span><Activity size={14} /> ACP protocol v1.0</span>
+                <span><Globe size={14} /> Port 8443</span>
+              </div>
+            </div>
+            <div className="relay-hero-state">
+              <StatusBadge value={operational ? 'online' : 'offline'} />
+              <span>{lastUpdated ? `Updated ${formatRelativeTime(lastUpdated)}` : 'Waiting for data'}</span>
+            </div>
+          </section>
+
+          <section className="relay-stat-grid" aria-label="Relay metrics">
+            <div className="relay-stat-card relay-stat-card--accent">
+              <div className="relay-stat-top"><span>Messages captured</span><MessageSquare size={16} /></div>
+              <strong>{dispatches.length}</strong>
+              <small>All relay traffic in the current store</small>
+            </div>
+            <div className="relay-stat-card">
+              <div className="relay-stat-top"><span>Connected peers</span><Server size={16} /></div>
+              <strong>{onlineAgents.length}<em> / {agents.length}</em></strong>
+              <small>{agents.length ? 'Agents checked in recently' : 'Waiting for first agent'}</small>
+            </div>
+            <div className="relay-stat-card relay-stat-card--amber">
+              <div className="relay-stat-top"><span>Broker queue</span><InboxIcon size={16} /></div>
+              <strong>{queued.length}</strong>
+              <small>Messages waiting for delivery or pickup</small>
+            </div>
+            <div className="relay-stat-card relay-stat-card--coral">
+              <div className="relay-stat-top"><span>Delivery issues</span><AlertCircle size={16} /></div>
+              <strong>{failed.length}</strong>
+              <small>{failed.length ? 'Review traffic for failed routes' : 'No failed routes detected'}</small>
+            </div>
+          </section>
+
+          <div className="relay-content-grid">
+            <section className="panel traffic-chart-panel">
+              <div className="panel-header">
+                <div><p className="eyebrow">Throughput</p><h2>Traffic pulse</h2></div>
+                <span className="panel-muted">Last 12 hours</span>
+              </div>
+              <div className="traffic-chart" aria-label="Messages captured over the last 12 hours">
+                <div className="chart-y-axis"><span>{maxTraffic}</span><span>{Math.ceil(maxTraffic / 2)}</span><span>0</span></div>
+                <div className="chart-bars">
+                  <div className="chart-gridline chart-gridline--top" />
+                  <div className="chart-gridline chart-gridline--middle" />
+                  {traffic.map((bucket) => (
+                    <div className="chart-bar-wrap" key={bucket.label}>
+                      <div className={`chart-bar ${bucket.count ? 'chart-bar--active' : ''}`} style={{ height: `${Math.max(bucket.count ? 10 : 3, (bucket.count / maxTraffic) * 100)}%` }} title={`${bucket.count} message${bucket.count === 1 ? '' : 's'} ${bucket.label} ago`} />
+                      <span>{bucket.label}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="chart-footer"><span><span className="legend-dot legend-dot--teal" /> Captured messages</span><span>{dispatches.length} total</span></div>
+            </section>
+
+            <section className="panel endpoint-panel">
+              <div className="panel-header">
+                <div><p className="eyebrow">Connection</p><h2>Relay endpoint</h2></div>
+                <Globe size={17} className="panel-icon" />
+              </div>
+              <div className="endpoint-visual"><span className="endpoint-line" /><span className="endpoint-node endpoint-node--left" /><span className="endpoint-node endpoint-node--right" /><span className="endpoint-pulse" /></div>
+              <div className="endpoint-address"><code>{endpoint}</code><button className="copy-button" onClick={() => void copyEndpoint()} title="Copy relay endpoint" aria-label="Copy relay endpoint"><Copy size={14} /></button></div>
+              <div className="endpoint-details">
+                <div><span>Health</span><strong><span className={`status-dot status-dot--${operational ? 'teal' : 'coral'}`} /> {operational ? 'Reachable' : 'Unavailable'}</strong></div>
+                <div><span>Identity</span><strong>{relay.agent || 'acp-relay'}</strong></div>
+                <div><span>Transport</span><strong>HTTP + WebSocket</strong></div>
+              </div>
+              <Link className="endpoint-link" to="/setup">View connection setup <ArrowRight size={13} /></Link>
+            </section>
+          </div>
+
+          <div className="relay-bottom-grid">
+            <section className="panel recent-panel">
+              <div className="panel-header"><div><p className="eyebrow">Live stream</p><h2>Recent routes</h2></div><Link className="btn btn--ghost btn--sm" to="/inbox">Open traffic <ArrowRight size={13} /></Link></div>
+              {recent.length ? (
+                <div className="relay-route-list">
+                  {recent.map((dispatch) => (
+                    <div className="relay-route-row" key={dispatch.dispatch_id}>
+                      <span className={`route-intent route-intent--${dispatch.intent}`}><Send size={12} /></span>
+                      <div className="relay-route-copy"><div><strong>{dispatch.from.agent_id}</strong><ArrowRight size={12} /><strong>{dispatch.to.agent_id}</strong></div><small>{dispatch.payload_preview || `${dispatch.intent} message`} · {formatRelativeTime(new Date(dispatch.last_updated))}</small></div>
+                      <StatusBadge value={dispatch.status} />
+                    </div>
+                  ))}
+                </div>
+              ) : <div className="empty-state"><MessageSquare size={28} /><p>No routes yet</p><small>Messages will appear here as agents connect.</small></div>}
+            </section>
+
+            <section className="panel peers-panel">
+              <div className="panel-header"><div><p className="eyebrow">Network</p><h2>Peer presence</h2></div><Link className="btn btn--ghost btn--sm" to="/agents">View peers <ArrowRight size={13} /></Link></div>
+              {agents.length ? (
+                <div className="relay-peer-list">
+                  {agents.slice(0, 5).map((agent) => (
+                    <div className="relay-peer-row" key={agent.peer.agent_id}><AgentAvatar agentId={agent.peer.agent_id} status={agent.status} /><div><strong>{agent.peer.agent_id}</strong><small>{agent.peer.machine_id}</small></div><span className="peer-last-seen"><StatusDot status={agent.status} /> {formatRelativeTime(agent.peer.last_seen_at)}</span></div>
+                  ))}
+                </div>
+              ) : <div className="empty-state"><Server size={26} /><p>No peers registered</p></div>}
+            </section>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── Agent Workspace ─────────────────────────────────────────────────────────
+
+function AgentWorkspace({ data }: { data: ReturnType<typeof useData> }) {
+  const { relay, dispatches, agents, loading, error, lastUpdated, load } = data;
+  const identity = relay.this_agent_id || 'agent';
+  const machine = relay.this_machine_id || 'local machine';
+  const incoming = dispatches.filter((dispatch) => dispatch.to.agent_id === identity);
+  const needsAction = incoming.filter((dispatch) => ['dispatched', 'accepted'].includes(dispatch.status));
+  const active = dispatches.filter((dispatch) => ['in_progress', 'verification'].includes(dispatch.status));
+  const completed = dispatches.filter((dispatch) => dispatch.status === 'complete');
+  const failed = dispatches.filter((dispatch) => ['blocked', 'delivery_failed'].includes(dispatch.status));
+  const relayPeer = agents.find((agent) => agent.is_relay);
+  const otherPeers = agents.filter((agent) => !agent.is_relay);
+  const recent = dispatches.slice(0, 7);
+
+  return (
+    <div className="page agent-page">
+      <PageHeader
+        eyebrow={`Agent / ${identity}`}
+        title="Your work, in one place."
+        description="See what arrived, what is moving, and where this agent is connected."
+        actions={
+          <>
+            <Link className="btn btn--ghost" to="/setup"><Settings2 size={14} /> Configure</Link>
+            <Link className="btn btn--primary" to="/inbox"><Send size={14} /> Send a message</Link>
+          </>
+        }
+      />
+
+      {error && <div className="alert alert--error" role="alert"><AlertCircle size={16} /> {error}</div>}
+
+      {loading && !lastUpdated ? <DashboardSkeleton /> : (
+        <>
+          <section className={`agent-hero ${relay.status === 'ok' ? 'agent-hero--online' : 'agent-hero--offline'}`}>
+            <div className="agent-identity-mark"><Cpu size={25} /><span /></div>
+            <div className="agent-hero-copy">
+              <div className="agent-hero-kicker"><span className={`status-dot status-dot--${relay.status === 'ok' ? 'teal' : 'coral'}`} /> Agent workspace</div>
+              <h2>{identity}</h2>
+              <p>{machine} · Ready to receive work from your network.</p>
+              <div className="agent-hero-meta"><span><ShieldCheck size={14} /> ACP v1.0</span><span><Globe size={14} /> {relay.status === 'ok' ? 'Relay connected' : 'Relay unavailable'}</span><span><Clock3 size={14} /> {lastUpdated ? `Synced ${formatRelativeTime(lastUpdated)}` : 'Not synced'}</span></div>
+            </div>
+            <div className="agent-hero-actions"><StatusBadge value={relay.status === 'ok' ? 'online' : 'offline'} /><Link to="/setup" className="text-link">Connection details <ExternalLink size={12} /></Link></div>
+          </section>
+
+          <section className="agent-stat-grid" aria-label="Agent work metrics">
+            <Link to="/inbox?filter=dispatched" className="agent-stat-card agent-stat-card--attention"><div><span>Needs attention</span><Target size={16} /></div><strong>{needsAction.length}</strong><small>{needsAction.length ? 'Incoming messages waiting for you' : 'Your inbox is clear'}</small></Link>
+            <Link to="/inbox?filter=in_progress" className="agent-stat-card agent-stat-card--blue"><div><span>In progress</span><Activity size={16} /></div><strong>{active.length}</strong><small>{active.length ? 'Work currently moving through this agent' : 'No active work right now'}</small></Link>
+            <Link to="/inbox?filter=complete" className="agent-stat-card agent-stat-card--teal"><div><span>Completed</span><CheckCircle2 size={16} /></div><strong>{completed.length}</strong><small>Completed messages in the current history</small></Link>
+            <Link to="/inbox?filter=blocked" className="agent-stat-card agent-stat-card--coral"><div><span>Blocked</span><AlertCircle size={16} /></div><strong>{failed.length}</strong><small>{failed.length ? 'Routes need a retry or owner' : 'No blocked routes'}</small></Link>
+          </section>
+
+          <div className="agent-main-grid">
+            <section className="panel agent-queue-panel">
+              <div className="panel-header"><div><p className="eyebrow">Action queue</p><h2>Messages for you</h2></div><Link className="btn btn--ghost btn--sm" to="/inbox">Open inbox <ArrowRight size={13} /></Link></div>
+              {needsAction.length ? <div className="agent-queue-list">{needsAction.slice(0, 5).map((dispatch) => <Link className="agent-queue-row" to="/inbox" key={dispatch.dispatch_id}><span className="queue-icon"><InboxIcon size={14} /></span><div><strong>{dispatch.from.agent_id}</strong><small>{dispatch.payload_preview || `${dispatch.intent} message`} · {formatRelativeTime(new Date(dispatch.last_updated))}</small></div><StatusBadge value={dispatch.status} /><ArrowRight size={14} /></Link>)}</div> : <div className="agent-empty"><CheckCircle2 size={27} /><div><strong>Nothing waiting for you</strong><p>New delegated work will appear here automatically.</p></div><Link className="btn btn--primary btn--sm" to="/inbox">View history</Link></div>}
+            </section>
+
+            <section className="panel agent-network-panel">
+              <div className="panel-header"><div><p className="eyebrow">Connections</p><h2>Network</h2></div><Link className="btn btn--ghost btn--sm" to="/agents">Manage <ArrowRight size={13} /></Link></div>
+              <div className="agent-connection-card"><div className="connection-orb"><Radio size={16} /></div><div><strong>Relay gateway</strong><small>{relayPeer?.peer.http_endpoint || 'Configured relay connection'}</small></div><StatusBadge value={relayPeer?.status === 'online' || relay.status === 'ok' ? 'online' : 'offline'} /></div>
+              <div className="agent-network-summary"><span><strong>{otherPeers.length}</strong> peer{otherPeers.length === 1 ? '' : 's'}</span><span><strong>{otherPeers.filter((peer) => peer.status === 'online').length}</strong> online</span><span><strong>{dispatches.length}</strong> messages</span></div>
+              <Link className="network-link" to="/setup"><ShieldCheck size={14} /> Review agent connection <ArrowRight size={13} /></Link>
+            </section>
+          </div>
+
+          <section className="panel agent-activity-panel">
+            <div className="panel-header"><div><p className="eyebrow">Activity</p><h2>Latest movement</h2></div><button className="btn btn--ghost btn--sm" onClick={() => void load()}><RefreshCw size={13} /> Refresh</button></div>
+            {recent.length ? <div className="agent-activity-list">{recent.map((dispatch) => <div className="agent-activity-row" key={dispatch.dispatch_id}><span className={`activity-marker activity-marker--${dispatch.intent}`}><Send size={11} /></span><div className="agent-activity-route"><strong>{dispatch.from.agent_id}</strong><ArrowRight size={12} /><strong>{dispatch.to.agent_id}</strong><small>{dispatch.payload_preview || `${dispatch.intent} message`}</small></div><StatusBadge value={dispatch.status} /><span className="activity-time">{formatRelativeTime(new Date(dispatch.last_updated))}</span></div>)}</div> : <div className="empty-state"><MessageSquare size={28} /><p>No activity yet</p><small>Messages will appear as this agent connects.</small></div>}
+          </section>
         </>
       )}
     </div>
@@ -1065,7 +1332,7 @@ type SetupConfig = {
 };
 
 const defaultSetup: SetupConfig = {
-  relayUrl: 'http://localhost:8444',
+  relayUrl: 'http://localhost:8443',
   agentId: 'my-agent',
   machineId: 'my-machine',
   endpoint: 'http://localhost:8444',
@@ -1632,7 +1899,7 @@ function App() {
         wsConnected={data.wsConnected}
       >
         <Routes>
-          <Route path="/" element={<Dashboard data={data} onAgentClick={openDetail} />} />
+          <Route path="/" element={data.relay.this_agent_id ? <AgentWorkspace data={data} /> : <RelayDashboard data={data} />} />
           <Route path="/inbox" element={<Inbox data={data} />} />
           <Route path="/agents" element={<Agents data={data} onAgentClick={openDetail} />} />
           <Route path="/setup" element={<Setup />} />

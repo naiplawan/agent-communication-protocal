@@ -45,7 +45,7 @@ cp .env.example .env  # or create manually with ACP_SHARED_SECRET
 docker compose up --build
 ```
 
-The relay listens on port `8443` and persists messages in the `acp-relay-data` Docker volume.
+The relay listens on port `8443` and persists messages in the `acp-relay-data` Docker volume. The relay dashboard is available at `http://localhost:3001` (host port `3000` is already in use on this machine).
 
 Check health:
 

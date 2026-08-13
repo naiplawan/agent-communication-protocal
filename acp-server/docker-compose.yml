@@ -28,5 +28,22 @@ services:
       retries: 3
     restart: unless-stopped
 
+  dashboard:
+    build:
+      context: ../acp-agent/acp-dashboard
+    container_name: acp-dashboard
+    hostname: dashboard
+    ports:
+      - "3001:3000"
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      - ACP_RELAY_URL=http://relay:8443
+    depends_on:
+      relay:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   acp-relay-data:

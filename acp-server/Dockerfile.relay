@@ -25,24 +25,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-# Cache cargo registry
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/target \
-    cargo new relay
+# Create a temporary crate so dependency compilation can be cached in the
+# image layers even when using Docker's legacy builder.
+RUN cargo new relay
 
 COPY relay-server/Cargo.toml ./relay/
 WORKDIR /build/relay
 
-# Pre-compile deps (cached)
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/target \
-    cargo build --release
+# Pre-compile deps
+RUN cargo build --release
 
-# Rebuild just our crate (fast on edits)
+# Rebuild just our crate
 COPY relay-server/src ./src/
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/target \
-    cargo build --release
+RUN cargo build --release
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
