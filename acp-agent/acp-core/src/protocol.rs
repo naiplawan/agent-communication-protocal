@@ -26,6 +26,37 @@ pub fn new_corr_id() -> String {
     new_msg_id()
 }
 
+/// Generate a new session ID for a user or automation conversation.
+#[must_use]
+pub fn new_session_id() -> String {
+    format!("ses_{}", ulid::Ulid::new().to_string().to_lowercase())
+}
+
+/// Generate a new run ID for one execution within a session.
+#[must_use]
+pub fn new_run_id() -> String {
+    format!("run_{}", ulid::Ulid::new().to_string().to_lowercase())
+}
+
+/// Current ACP wire-protocol version.
+pub const PROTOCOL_VERSION: &str = "1.1";
+
+/// Wire versions accepted during initialization, newest first.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["1.1", "1.0"];
+
+/// Select the newest version supported by both peers.
+#[must_use]
+pub fn negotiate_protocol_version(requested: &[String]) -> Option<&'static str> {
+    if requested.is_empty() {
+        return Some(PROTOCOL_VERSION);
+    }
+
+    SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .find(|version| requested.iter().any(|candidate| candidate == **version))
+        .copied()
+}
+
 /// Generate a new acknowledgement ID with `ack_` prefix.
 #[must_use]
 pub fn new_ack_id() -> String {
@@ -336,6 +367,12 @@ pub struct Envelope {
     /// Groups every message belonging to one exchange.
     #[serde(default)]
     pub corr_id: Option<String>,
+    /// User or automation conversation this message belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// One execution within `session_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     /// Who started the chain.
     #[serde(default)]
     pub origin: Option<Origin>,
@@ -430,6 +467,12 @@ pub struct StreamFrame {
     /// Correlation ID of the exchange.
     #[serde(default)]
     pub corr_id: Option<String>,
+    /// Session this stream belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Run this stream belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     /// Zero-based frame index.
     pub seq: u32,
     /// Total frame count, when known up front.
@@ -451,6 +494,10 @@ pub struct StreamChunk<'a> {
     pub msg_id: &'a str,
     /// Correlation ID of the exchange.
     pub corr_id: &'a str,
+    /// Session this stream belongs to.
+    pub session_id: Option<&'a str>,
+    /// Run this stream belongs to.
+    pub run_id: Option<&'a str>,
     /// Zero-based frame index.
     pub seq: u32,
     /// Total frame count, when known up front.
@@ -476,6 +523,8 @@ pub fn build_ws_frame(chunk: StreamChunk<'_>) -> serde_json::Value {
         total,
         final_,
         data,
+        session_id,
+        run_id,
     } = chunk;
 
     serde_json::json!({
@@ -483,6 +532,8 @@ pub fn build_ws_frame(chunk: StreamChunk<'_>) -> serde_json::Value {
             stream_id: stream_id.to_string(),
             msg_id: msg_id.to_string(),
             corr_id: Some(corr_id.to_string()),
+            session_id: session_id.map(String::from),
+            run_id: run_id.map(String::from),
             seq,
             total,
             final_,
@@ -503,6 +554,14 @@ pub fn parse_ws_frame(raw: &serde_json::Value) -> Option<StreamFrame> {
         msg_id: frame.get("msg_id")?.as_str()?.to_string(),
         corr_id: frame
             .get("corr_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        session_id: frame
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        run_id: frame
+            .get("run_id")
             .and_then(|v| v.as_str())
             .map(String::from),
         seq: u32::try_from(frame.get("seq")?.as_u64()?).ok()?,
@@ -535,6 +594,10 @@ pub struct NewEnvelope<'a> {
     pub msg_id: String,
     /// Correlation ID for the exchange.
     pub corr_id: String,
+    /// User or automation conversation this message belongs to.
+    pub session_id: Option<String>,
+    /// One execution within `session_id`.
+    pub run_id: Option<String>,
     /// Who started the chain.
     pub origin: Origin,
     /// Sending agent.
@@ -568,6 +631,8 @@ pub fn build_envelope(spec: NewEnvelope<'_>) -> Envelope {
     Envelope {
         msg_id: spec.msg_id,
         corr_id: Some(spec.corr_id),
+        session_id: spec.session_id,
+        run_id: spec.run_id,
         origin: Some(spec.origin),
         sender: AgentAddr::new(spec.sender.0, spec.sender.1),
         recipient: AgentAddr::new(spec.recipient.0, spec.recipient.1),
@@ -610,6 +675,8 @@ pub fn forward_envelope(
     Ok(Envelope {
         msg_id: envelope.msg_id.clone(),
         corr_id: envelope.corr_id.clone(),
+        session_id: envelope.session_id.clone(),
+        run_id: envelope.run_id.clone(),
         origin: envelope.origin.clone(),
         sender: AgentAddr::new(new_sender_agent_id, new_sender_machine_id),
         recipient: AgentAddr::new(new_recipient_agent_id, new_recipient_machine_id),
@@ -656,6 +723,8 @@ pub fn reply_envelope(
     Ok(Envelope {
         msg_id: envelope.msg_id.clone(),
         corr_id: envelope.corr_id.clone(),
+        session_id: envelope.session_id.clone(),
+        run_id: envelope.run_id.clone(),
         origin: envelope.origin.clone(),
         sender: AgentAddr::new(new_sender_agent_id, new_sender_machine_id),
         recipient: AgentAddr::new(next_agent_id, next_machine_id),
@@ -711,6 +780,8 @@ mod tests {
         build_envelope(NewEnvelope {
             msg_id: new_msg_id(),
             corr_id: new_corr_id(),
+            session_id: None,
+            run_id: None,
             origin: Origin::default(),
             sender,
             recipient,
@@ -784,6 +855,18 @@ mod tests {
     }
 
     #[test]
+    fn forwarding_preserves_session_and_run_context() {
+        let mut env = envelope_between(("A", "m1"), ("B", "m2"), vec!["A@m1".to_string()]);
+        env.session_id = Some("ses_123".to_string());
+        env.run_id = Some("run_123".to_string());
+
+        let forwarded = forward_envelope(&env, "B", "m2", "C", "m3").unwrap();
+
+        assert_eq!(forwarded.session_id.as_deref(), Some("ses_123"));
+        assert_eq!(forwarded.run_id.as_deref(), Some("run_123"));
+    }
+
+    #[test]
     fn forward_appends_the_forwarder_to_the_reply_path() {
         let env = envelope_between(("A", "m1"), ("B", "m2"), vec!["X@mX".to_string()]);
 
@@ -840,6 +923,8 @@ mod tests {
             stream_id: "str_abc",
             msg_id: "msg_123",
             corr_id: "msg_123",
+            session_id: Some("ses_123"),
+            run_id: Some("run_123"),
             seq: 0,
             total: Some(5),
             final_: false,
@@ -849,5 +934,17 @@ mod tests {
         let parsed = parse_ws_frame(&frame).unwrap();
         assert_eq!(parsed.stream_id, "str_abc");
         assert_eq!(parsed.total, Some(5));
+        assert_eq!(parsed.session_id.as_deref(), Some("ses_123"));
+        assert_eq!(parsed.run_id.as_deref(), Some("run_123"));
+    }
+
+    #[test]
+    fn negotiation_prefers_the_newest_common_version() {
+        assert_eq!(
+            negotiate_protocol_version(&["1.0".to_string(), "1.1".to_string()]),
+            Some("1.1")
+        );
+        assert_eq!(negotiate_protocol_version(&["0.9".to_string()]), None);
+        assert_eq!(negotiate_protocol_version(&[]), Some(PROTOCOL_VERSION));
     }
 }

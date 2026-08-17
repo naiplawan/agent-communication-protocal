@@ -21,6 +21,7 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    wget \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -39,5 +40,8 @@ ENV ACP_PEERS_PATH=/etc/acp/acp-peers.yaml \
 EXPOSE 8444
 
 USER acp
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+    CMD wget -q -O - http://127.0.0.1:8444/health || exit 1
 
 CMD ["acp-agent", "run", "--port", "8444", "--use-signaling"]

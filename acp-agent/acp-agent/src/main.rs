@@ -213,7 +213,7 @@ async fn drain_pending(agent: &ACPAgent, relay: &Peer, resp: &serde_json::Value)
         };
 
         let msg_id = message.envelope.msg_id.clone();
-        agent.process_message(message).await;
+        agent.handle_incoming(message).await;
         if let Err(e) = agent
             .client
             .ack_message(relay, &msg_id, MessageAck::processed("hop_ack"))

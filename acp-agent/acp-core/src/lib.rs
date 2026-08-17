@@ -14,6 +14,8 @@
 //! let envelope = build_envelope(NewEnvelope {
 //!     msg_id: new_msg_id(),
 //!     corr_id: new_corr_id(),
+//!     session_id: None,
+//!     run_id: None,
 //!     origin: Origin::default(),
 //!     sender: ("agent-alpha", "laptop-1"),
 //!     recipient: ("agent-beta", "server-1"),

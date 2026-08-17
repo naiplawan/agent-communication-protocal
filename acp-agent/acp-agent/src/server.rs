@@ -4,7 +4,11 @@
 
 use std::sync::Arc;
 
-use acp_core::protocol::{new_stream_id, Envelope, Message};
+use acp_core::protocol::{
+    negotiate_protocol_version, new_stream_id, Envelope, Message, PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
+};
+use acp_core::security::{verify_token, TokenPayload};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{AppendHeaders, IntoResponse, Response};
@@ -103,6 +107,12 @@ pub struct StreamInitRequest {
     pub msg_id: String,
     /// Correlation ID of the exchange.
     pub corr_id: String,
+    /// Session this stream belongs to.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Run this stream belongs to.
+    #[serde(default)]
+    pub run_id: Option<String>,
     /// What the stream carries, e.g. `"reply"`.
     #[serde(default = "default_stream_type")]
     pub stream_type: String,
@@ -120,6 +130,18 @@ pub struct StreamInitResponse {
     pub stream_id: String,
     /// WebSocket URL to send frames to.
     pub ws_url: String,
+}
+
+/// Body of `POST /acp/v1/initialize`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct InitializeRequest {
+    /// Protocol versions the caller can speak, newest first.
+    #[serde(default)]
+    protocol_versions: Vec<String>,
+    /// Features the caller would like to use.
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +198,55 @@ fn agent_unavailable() -> Response {
     error_resp("Agent not initialized", StatusCode::SERVICE_UNAVAILABLE)
 }
 
+/// Verify a token addressed to this agent and optionally bound to one message.
+fn authenticate(
+    headers: &HeaderMap,
+    agent: &ACPAgent,
+    required_msg_id: Option<&str>,
+) -> Result<TokenPayload, Box<Response>> {
+    let secret = match std::env::var(SHARED_SECRET_ENV) {
+        Ok(secret) if !secret.is_empty() => secret,
+        _ => {
+            return Err(Box::new(error_resp(
+                "Authentication is required",
+                StatusCode::UNAUTHORIZED,
+            )))
+        }
+    };
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("ACP-Token "))
+        .ok_or_else(|| {
+            Box::new(error_resp(
+                "Invalid Authorization header",
+                StatusCode::UNAUTHORIZED,
+            ))
+        })?;
+
+    verify_token(
+        auth,
+        &secret,
+        &agent.this.agent_id,
+        agent.this.machine_id.as_deref().unwrap_or_default(),
+        required_msg_id,
+    )
+    .map_err(|error| Box::new(error_resp(&error.to_string(), StatusCode::UNAUTHORIZED)))
+}
+
+fn authenticate_observability(headers: &HeaderMap, agent: &ACPAgent) -> Option<Response> {
+    if std::env::var("ACP_PUBLIC_DEBUG")
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        tracing::warn!("ACP_PUBLIC_DEBUG is enabled; exposing authenticated diagnostics publicly");
+        return None;
+    }
+    authenticate(headers, agent, None)
+        .err()
+        .map(|response| *response)
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -201,11 +272,34 @@ async fn health(State(state): State<SharedState>) -> Response {
 }
 
 /// `POST /acp/v1/messages/send` — forward a message to its envelope recipient.
-async fn send_message(State(state): State<SharedState>, Json(body): Json<SendRequest>) -> Response {
+async fn send_message(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(body): Json<SendRequest>,
+) -> Response {
     let agent_guard = state.agent.read().await;
     let Some(agent) = agent_guard.as_ref() else {
         return agent_unavailable();
     };
+    let claims = match authenticate(&headers, agent, Some(&body.envelope.msg_id)) {
+        Ok(claims) => claims,
+        Err(response) => return *response,
+    };
+    let expected_sender = format!(
+        "{}@{}",
+        body.envelope.sender.agent_id,
+        body.envelope
+            .sender
+            .machine_id
+            .as_deref()
+            .unwrap_or_default()
+    );
+    if claims.iss != expected_sender {
+        return error_resp(
+            "Token issuer does not match envelope sender",
+            StatusCode::FORBIDDEN,
+        );
+    }
 
     let message = Message {
         envelope: body.envelope,
@@ -225,7 +319,13 @@ async fn send_message(State(state): State<SharedState>, Json(body): Json<SendReq
 }
 
 /// `GET /acp/v1/messages/pending` — everything this agent knows about.
-async fn get_pending(State(state): State<SharedState>) -> Response {
+async fn get_pending(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let agent_guard = state.agent.read().await;
+    if let Some(agent) = agent_guard.as_ref() {
+        if let Err(response) = authenticate(&headers, agent, Some("poll_pending")) {
+            return *response;
+        }
+    }
     let messages = collect_messages(&state).await;
     with_cors(Json(serde_json::json!({
         "count": messages.len(),
@@ -234,7 +334,13 @@ async fn get_pending(State(state): State<SharedState>) -> Response {
 }
 
 /// `GET /acp/v1/debug/messages` — the same list, without the count.
-async fn debug_messages(State(state): State<SharedState>) -> Response {
+async fn debug_messages(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let agent_guard = state.agent.read().await;
+    if let Some(agent) = agent_guard.as_ref() {
+        if let Some(response) = authenticate_observability(&headers, agent) {
+            return response;
+        }
+    }
     let messages = collect_messages(&state).await;
     with_cors(Json(serde_json::json!({ "messages": messages })))
 }
@@ -248,11 +354,18 @@ async fn collect_messages(state: &SharedState) -> Vec<serde_json::Value> {
 }
 
 /// `GET /acp/v1/messages/{msg_id}/status` — where one message stands.
-async fn message_status(State(state): State<SharedState>, Path(msg_id): Path<String>) -> Response {
+async fn message_status(
+    State(state): State<SharedState>,
+    Path(msg_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let agent_guard = state.agent.read().await;
     let Some(agent) = agent_guard.as_ref() else {
         return agent_unavailable();
     };
+    if let Err(response) = authenticate(&headers, agent, Some(&msg_id)) {
+        return *response;
+    }
 
     let status = agent
         .get_all_messages()
@@ -289,7 +402,7 @@ async fn capabilities(State(state): State<SharedState>) -> Response {
     );
 
     with_cors(Json(serde_json::json!({
-        "protocol_version": "1.0",
+        "protocol_version": PROTOCOL_VERSION,
         "agent_id": agent_id,
         "machine_id": machine_id,
         "role": "agent",
@@ -303,12 +416,60 @@ async fn capabilities(State(state): State<SharedState>) -> Response {
     })))
 }
 
+/// `POST /acp/v1/initialize` — authenticate and negotiate protocol features.
+async fn initialize(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(body): Json<InitializeRequest>,
+) -> Response {
+    let agent_guard = state.agent.read().await;
+    let Some(agent) = agent_guard.as_ref() else {
+        return agent_unavailable();
+    };
+    if let Err(response) = authenticate(&headers, agent, Some("initialize")) {
+        return *response;
+    }
+
+    let Some(protocol_version) = negotiate_protocol_version(&body.protocol_versions) else {
+        return error_resp("UNSUPPORTED_PROTOCOL_VERSION", StatusCode::BAD_REQUEST);
+    };
+
+    let features = ["session-context", "run-context", "streaming"];
+    let accepted_capabilities: Vec<&str> = body
+        .capabilities
+        .iter()
+        .map(String::as_str)
+        .filter(|capability| features.contains(capability))
+        .collect();
+
+    with_cors(Json(serde_json::json!({
+        "protocol_version": protocol_version,
+        "server_protocol_version": PROTOCOL_VERSION,
+        "supported_protocol_versions": SUPPORTED_PROTOCOL_VERSIONS,
+        "role": "agent",
+        "agent_id": agent.this.agent_id,
+        "machine_id": agent.this.machine_id.clone().unwrap_or_default(),
+        "capabilities": agent.this.capabilities,
+        "accepted_capabilities": accepted_capabilities,
+        "features": features,
+        "intents": [
+            "delegate", "reply", "ack", "error",
+            "stream_start", "stream_chunk", "stream_end",
+        ],
+        "content_types": ["application/json"],
+        "auth": ["signed-token"],
+    })))
+}
+
 /// `GET /acp/v1/peers` — the peers this agent is configured to reach.
-async fn get_peers(State(state): State<SharedState>) -> Response {
+async fn get_peers(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     let agent_guard = state.agent.read().await;
     let Some(agent) = agent_guard.as_ref() else {
         return with_cors(Json(serde_json::json!({ "peers": [] })));
     };
+    if let Some(response) = authenticate_observability(&headers, agent) {
+        return response;
+    }
 
     let peers: Vec<serde_json::Value> = agent
         .get_peers()
@@ -404,17 +565,25 @@ async fn relay_forward(
 ///
 /// The audience is checked against the envelope's own recipient rather than this
 /// agent's configured identity: the relay derives it from the same field, and the
-/// caller has already confirmed that recipient is us. Without `ACP_SHARED_SECRET`
-/// the agent is in the documented trusted-network mode and cannot verify anything.
+/// caller has already confirmed that recipient is us. Unauthenticated forwarding
+/// is available only through an explicit development-only opt-in.
 fn verify_forward_auth(headers: &HeaderMap, envelope: &Envelope) -> Result<(), String> {
     let secret = match std::env::var(SHARED_SECRET_ENV) {
         Ok(s) if !s.is_empty() => s,
-        _ => {
+        _ if std::env::var("ACP_ALLOW_UNAUTHENTICATED_FORWARD")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false) =>
+        {
             tracing::warn!(
-                "[FORWARD] {SHARED_SECRET_ENV} not set — accepting {} unauthenticated",
+                "[FORWARD] ACP_ALLOW_UNAUTHENTICATED_FORWARD is enabled — accepting {} unauthenticated",
                 envelope.msg_id
             );
             return Ok(());
+        }
+        _ => {
+            return Err(format!(
+                "{SHARED_SECRET_ENV} is required for forwarded messages"
+            ))
         }
     };
 
@@ -439,7 +608,19 @@ fn verify_forward_auth(headers: &HeaderMap, envelope: &Envelope) -> Result<(), S
 }
 
 /// `POST /acp/v1/messages/{msg_id}/ack` — record a peer's acknowledgement.
-async fn ack_message(Path(msg_id): Path<String>, Json(body): Json<AckRequest>) -> Response {
+async fn ack_message(
+    State(state): State<SharedState>,
+    Path(msg_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<AckRequest>,
+) -> Response {
+    let agent_guard = state.agent.read().await;
+    let Some(agent) = agent_guard.as_ref() else {
+        return agent_unavailable();
+    };
+    if let Err(response) = authenticate(&headers, agent, Some(&msg_id)) {
+        return *response;
+    }
     tracing::debug!(
         "[ACK] {msg_id} ack_id={} received={} processed={} stream_available={}",
         body.ack_id,
@@ -454,7 +635,19 @@ async fn ack_message(Path(msg_id): Path<String>, Json(body): Json<AckRequest>) -
 }
 
 /// `POST /acp/v1/messages/{msg_id}/error` — record a peer's failure report.
-async fn error_message(Path(msg_id): Path<String>, Json(body): Json<ErrorRequest>) -> Response {
+async fn error_message(
+    State(state): State<SharedState>,
+    Path(msg_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<ErrorRequest>,
+) -> Response {
+    let agent_guard = state.agent.read().await;
+    let Some(agent) = agent_guard.as_ref() else {
+        return agent_unavailable();
+    };
+    if let Err(response) = authenticate(&headers, agent, Some(&msg_id)) {
+        return *response;
+    }
     tracing::warn!(
         "[ERR] {msg_id} code={} retryable={} msg={}",
         body.error_code,
@@ -467,19 +660,25 @@ async fn error_message(Path(msg_id): Path<String>, Json(body): Json<ErrorRequest
 /// `POST /acp/v1/stream/init` — allocate a stream ID and hand back its URL.
 async fn stream_init(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<StreamInitRequest>,
 ) -> Response {
     let agent_guard = state.agent.read().await;
     let Some(agent) = agent_guard.as_ref() else {
         return agent_unavailable();
     };
+    if let Err(response) = authenticate(&headers, agent, Some(&body.msg_id)) {
+        return *response;
+    }
 
     let stream_id = new_stream_id();
     tracing::debug!(
-        "[STREAM] {stream_id} type={} for msg={} corr={}",
+        "[STREAM] {stream_id} type={} for msg={} corr={} session={:?} run={:?}",
         body.stream_type,
         body.msg_id,
         body.corr_id,
+        body.session_id,
+        body.run_id,
     );
 
     let ws_url = format!(
@@ -507,6 +706,7 @@ pub fn build_router(agent: ACPAgent) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/acp/v1/capabilities", get(capabilities))
+        .route("/acp/v1/initialize", post(initialize))
         .route("/acp/v1/messages/{msg_id}/status", get(message_status))
         .route("/acp/v1/debug/messages", get(debug_messages))
         .route("/acp/v1/peers", get(get_peers))

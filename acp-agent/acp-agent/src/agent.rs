@@ -68,6 +68,10 @@ pub struct InboxEntry {
     pub msg_id: String,
     /// Correlation ID of the exchange.
     pub corr_id: String,
+    /// User or automation conversation this message belongs to.
+    pub session_id: Option<String>,
+    /// One execution within the session.
+    pub run_id: Option<String>,
     /// Sending agent.
     pub sender_agent: String,
     /// Machine the sender ran on.
@@ -271,6 +275,8 @@ impl ACPAgent {
         let envelope = build_envelope(NewEnvelope {
             msg_id: new_msg_id(),
             corr_id: new_corr_id(),
+            session_id: Some(acp_core::protocol::new_session_id()),
+            run_id: Some(acp_core::protocol::new_run_id()),
             origin: origin.unwrap_or_else(|| Origin {
                 agent_id: Some(self.this.agent_id.clone()),
                 machine_id: self.this.machine_id.clone(),
@@ -559,9 +565,26 @@ impl ACPAgent {
     /// Record an incoming message, dispatch it, and auto-reply when the handler
     /// returns a payload and the message carries a reply path.
     pub async fn handle_incoming(&self, message: Message) {
+        {
+            let mut pending = self.pending.write().await;
+            if pending.contains_key(&message.envelope.msg_id) {
+                tracing::debug!(
+                    msg_id = %message.envelope.msg_id,
+                    "ignoring duplicate incoming message"
+                );
+                return;
+            }
+            pending.insert(
+                message.envelope.msg_id.clone(),
+                PendingMessage {
+                    message: message.clone(),
+                    state: AgentState::Received,
+                    created_at: now_f64(),
+                    stream_id: None,
+                },
+            );
+        }
         self.record_inbox(&message).await;
-        self.track_pending(&message.envelope.msg_id, &message, AgentState::Received)
-            .await;
         *self.state.write().await = AgentState::Received;
 
         let result = self.process_message(message.clone()).await;
@@ -584,6 +607,8 @@ impl ACPAgent {
         self.inbox.write().await.push(InboxEntry {
             msg_id: envelope.msg_id.clone(),
             corr_id: envelope.corr_id.clone().unwrap_or_default(),
+            session_id: envelope.session_id.clone(),
+            run_id: envelope.run_id.clone(),
             sender_agent: envelope.sender.agent_id.clone(),
             sender_machine: envelope.sender.machine_id.clone().unwrap_or_default(),
             recipient_agent: envelope.recipient.agent_id.clone(),
@@ -657,6 +682,8 @@ impl ACPAgent {
                 serde_json::json!({
                     "msg_id": entry.msg_id,
                     "corr_id": entry.corr_id,
+                    "session_id": entry.session_id,
+                    "run_id": entry.run_id,
                     "sender_agent": entry.sender_agent,
                     "sender_machine": entry.sender_machine,
                     "recipient_agent": entry.recipient_agent,
@@ -682,6 +709,8 @@ impl ACPAgent {
             result.push(serde_json::json!({
                 "msg_id": env.msg_id,
                 "corr_id": env.corr_id,
+                "session_id": env.session_id,
+                "run_id": env.run_id,
                 "sender_agent": env.sender.agent_id,
                 "sender_machine": env.sender.machine_id,
                 "recipient_agent": env.recipient.agent_id,

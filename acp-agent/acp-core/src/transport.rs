@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::{ACPConfig, Peer};
-use crate::protocol::{build_ws_frame, new_ack_id, Message, StreamChunk};
+use crate::protocol::{
+    build_ws_frame, new_ack_id, Message, StreamChunk, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+};
 use crate::security::{create_token, AUTH_TYPE_SIGNED_TOKEN};
 
 /// Environment variable holding the fallback shared signing secret.
@@ -69,6 +71,7 @@ impl ACPHttpClient {
     pub fn new(config: ACPConfig, this_agent_id: String, this_machine_id: String) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -83,21 +86,25 @@ impl ACPHttpClient {
     ///
     /// Returns `None` for mTLS peers — those authenticate at the TLS layer — and
     /// for signed-token peers with no reachable secret.
-    fn build_auth_header(&self, peer: &Peer, msg_id: &str) -> Option<String> {
+    fn build_auth_header(
+        &self,
+        peer: &Peer,
+        msg_id: &str,
+    ) -> Result<Option<String>, TransportError> {
         let auth = peer.auth.clone().unwrap_or_default();
         if auth.auth_type != AUTH_TYPE_SIGNED_TOKEN {
-            return None;
+            return Ok(None);
         }
 
-        let Some(secret) = auth
-            .get_secret()
-            .or_else(|| std::env::var(SHARED_SECRET_ENV).ok())
-        else {
-            tracing::warn!(
-                "No secret found for peer {}. Set {SHARED_SECRET_ENV} or configure peer auth.",
-                peer.agent_id
-            );
-            return None;
+        let Some(secret) = auth.get_secret().or_else(|| {
+            std::env::var(SHARED_SECRET_ENV)
+                .ok()
+                .filter(|s| !s.is_empty())
+        }) else {
+            return Err(TransportError::SecurityError(
+                peer.agent_id.clone(),
+                format!("No signing secret found; set {SHARED_SECRET_ENV} or configure peer auth"),
+            ));
         };
 
         let token = create_token(
@@ -109,7 +116,7 @@ impl ACPHttpClient {
             &secret,
             i64::try_from(self.config.security.token_ttl_seconds).unwrap_or(i64::MAX),
         );
-        Some(format!("ACP-Token {token}"))
+        Ok(Some(format!("ACP-Token {token}")))
     }
 
     async fn do_request(
@@ -128,7 +135,7 @@ impl ACPHttpClient {
             .header("User-Agent", "acp-rust/0.1");
 
         if let (Some(peer), Some(msg_id)) = (peer, msg_id) {
-            if let Some(auth_header) = self.build_auth_header(peer, msg_id) {
+            if let Some(auth_header) = self.build_auth_header(peer, msg_id)? {
                 req = req.header("Authorization", auth_header);
             }
         }
@@ -174,6 +181,40 @@ impl ACPHttpClient {
     }
 
     // ---- Message operations ----
+
+    /// Negotiate the ACP version and features supported by `peer`.
+    ///
+    /// The request is authenticated and its token is bound to the literal
+    /// `initialize` request name rather than to a message ID.
+    ///
+    /// # Errors
+    /// Returns a [`TransportError`] when the peer cannot be reached, rejects
+    /// the handshake, or returns an invalid initialization response.
+    pub async fn initialize(
+        &self,
+        peer: &Peer,
+        capabilities: &[&str],
+    ) -> Result<InitializeResponse, TransportError> {
+        let url = format!("{}/acp/v1/initialize", peer.http_endpoint);
+        let body = serde_json::json!({
+            "protocol_versions": SUPPORTED_PROTOCOL_VERSIONS,
+            "capabilities": capabilities,
+        });
+        let value = self
+            .do_request(
+                reqwest::Method::POST,
+                &url,
+                Some(peer),
+                Some("initialize"),
+                Some(body),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(|error| {
+            TransportError::Transport(format!(
+                "Invalid initialize response for protocol {PROTOCOL_VERSION}: {error}"
+            ))
+        })
+    }
 
     /// `POST /acp/v1/messages/send`.
     ///
@@ -538,4 +579,41 @@ pub struct StatusResponse {
     /// When it reached its recipient, RFC 3339.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<String>,
+}
+
+/// Body returned by `POST /acp/v1/initialize`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct InitializeResponse {
+    /// Version selected for this connection.
+    pub protocol_version: String,
+    /// Highest version the peer supports.
+    pub server_protocol_version: String,
+    /// Versions the peer accepts on future initializations.
+    #[serde(default)]
+    pub supported_protocol_versions: Vec<String>,
+    /// Peer role, such as `agent` or `relay`.
+    pub role: String,
+    /// Logical peer ID.
+    pub agent_id: String,
+    /// Peer machine ID.
+    pub machine_id: String,
+    /// Peer-declared capabilities.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Requested features accepted by the peer.
+    #[serde(default)]
+    pub accepted_capabilities: Vec<String>,
+    /// Features the peer can use with this protocol version.
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// Message intents accepted by the peer.
+    #[serde(default)]
+    pub intents: Vec<String>,
+    /// Payload MIME types accepted by the peer.
+    #[serde(default)]
+    pub content_types: Vec<String>,
+    /// Authentication schemes accepted by the peer.
+    #[serde(default)]
+    pub auth: Vec<String>,
 }

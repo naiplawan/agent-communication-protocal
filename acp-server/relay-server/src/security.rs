@@ -35,19 +35,27 @@ fn b64_decode(input: &str) -> Result<Vec<u8>, TokenError> {
         .map_err(|_| TokenError::Malformed)
 }
 
-/// Decode a hex secret into key bytes.
-///
-/// Non-hex pairs decode to zero rather than failing, so a raw (non-hex) secret is
-/// still usable as a key as long as both ends read it the same way. A trailing
-/// odd nibble is read on its own rather than indexing past the end.
-fn hex_to_bytes(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            let end = (i + 2).min(hex.len());
-            u8::from_str_radix(&hex[i..end], 16).unwrap_or(0)
-        })
+/// Convert an even-length hexadecimal secret to bytes; other secrets are used
+/// as raw UTF-8 bytes.
+pub(crate) fn secret_bytes(secret: &str) -> Vec<u8> {
+    let bytes = secret.as_bytes();
+    if !bytes.len().is_multiple_of(2) || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return bytes.to_vec();
+    }
+
+    bytes
+        .chunks_exact(2)
+        .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
         .collect()
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => unreachable!("hex_nibble only receives hexadecimal input"),
+    }
 }
 
 /// Verify a signed token and return its claims.
@@ -59,6 +67,9 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
 /// # Errors
 /// Returns the [`TokenError`] naming the first check that failed.
 pub fn verify_token(token: &str, secret: &str) -> Result<TokenClaims, TokenError> {
+    if secret.is_empty() {
+        return Err(TokenError::Malformed);
+    }
     let parts: Vec<&str> = token.split('.').collect();
     let [header_b64, payload_b64, sig_b64] = parts[..] else {
         return Err(TokenError::Malformed);
@@ -69,9 +80,9 @@ pub fn verify_token(token: &str, secret: &str) -> Result<TokenClaims, TokenError
     }
 
     let mut mac =
-        HmacSha256::new_from_slice(&hex_to_bytes(secret)).map_err(|_| TokenError::Malformed)?;
+        HmacSha256::new_from_slice(&secret_bytes(secret)).map_err(|_| TokenError::Malformed)?;
     mac.update(format!("{header_b64}.{payload_b64}").as_bytes());
-    if mac.finalize().into_bytes().as_slice() != b64_decode(sig_b64)? {
+    if mac.verify_slice(&b64_decode(sig_b64)?).is_err() {
         return Err(TokenError::InvalidSignature);
     }
 
@@ -85,18 +96,37 @@ pub fn verify_token(token: &str, secret: &str) -> Result<TokenClaims, TokenError
             .ok_or(TokenError::Malformed)
     };
 
+    let issuer = claim("iss")?;
+    if issuer.is_empty() {
+        return Err(TokenError::Malformed);
+    }
+    let nonce = claim("nonce")?;
+    if nonce.is_empty() {
+        return Err(TokenError::Malformed);
+    }
+    let msg_id = claim("msg_id")?;
+    if msg_id.is_empty() {
+        return Err(TokenError::Malformed);
+    }
     let exp_str = claim("exp")?;
     let exp = chrono::DateTime::parse_from_rfc3339(&exp_str)
         .map_err(|_| TokenError::Malformed)?
         .timestamp();
-    if exp < chrono::Utc::now().timestamp() {
+    let iat = chrono::DateTime::parse_from_rfc3339(&claim("iat")?)
+        .map_err(|_| TokenError::Malformed)?
+        .timestamp();
+    let now = chrono::Utc::now().timestamp();
+    if iat > now + 60 || exp < iat {
+        return Err(TokenError::Malformed);
+    }
+    if exp < now {
         return Err(TokenError::Expired);
     }
 
     Ok(TokenClaims {
-        iss: claim("iss")?,
+        iss: issuer,
         sub: claim("aud")?,
-        msg_id: claim("msg_id")?,
+        msg_id,
         exp,
     })
 }

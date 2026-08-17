@@ -111,8 +111,9 @@ fn base64url_decode(input: &str) -> Result<Vec<u8>, TokenError> {
 
 /// Create an HMAC-SHA256 signed token bound to `msg_id`.
 ///
-/// `secret` may be hex-encoded or raw: bytes are read as hex pairs, and a pair
-/// that is not valid hex reads as zero, so both ends need only agree.
+/// secret may be an even-length hexadecimal string or any raw UTF-8 string.
+/// Valid hexadecimal strings retain their byte-oriented encoding; other values
+/// are used verbatim.
 ///
 /// # Panics
 /// Cannot panic in practice. The claims are a `serde_json::Value` built from
@@ -158,10 +159,18 @@ pub fn create_token(
 ///
 /// HMAC accepts a key of any length, so this cannot fail.
 fn sign(signing_input: &str, secret: &str) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(&hex_to_bytes(secret))
+    let mut mac = HmacSha256::new_from_slice(&secret_bytes(secret))
         .expect("HMAC-SHA256 accepts a key of any size");
     mac.update(signing_input.as_bytes());
     mac.finalize().into_bytes().to_vec()
+}
+
+fn verify_signature(signing_input: &str, secret: &str, signature: &[u8]) -> bool {
+    let Ok(mut mac) = HmacSha256::new_from_slice(&secret_bytes(secret)) else {
+        return false;
+    };
+    mac.update(signing_input.as_bytes());
+    mac.verify_slice(signature).is_ok()
 }
 
 /// Verify a signed token and return its claims.
@@ -178,6 +187,9 @@ pub fn verify_token(
     expected_audience_machine_id: &str,
     required_msg_id: Option<&str>,
 ) -> Result<TokenPayload, TokenError> {
+    if secret.is_empty() {
+        return Err(TokenError::Malformed);
+    }
     let parts: Vec<&str> = token.split('.').collect();
     let [header_b64, payload_b64, sig_b64] = parts[..] else {
         return Err(TokenError::Malformed);
@@ -187,8 +199,8 @@ pub fn verify_token(
         return Err(TokenError::InvalidHeader);
     }
 
-    let expected_sig = sign(&format!("{header_b64}.{payload_b64}"), secret);
-    if expected_sig != base64url_decode(sig_b64)? {
+    let signature = base64url_decode(sig_b64)?;
+    if !verify_signature(&format!("{header_b64}.{payload_b64}"), secret, &signature) {
         return Err(TokenError::SignatureMismatch);
     }
 
@@ -202,15 +214,42 @@ pub fn verify_token(
         return Err(TokenError::AudienceMismatch(aud.to_string(), expected_aud));
     }
 
+    let issuer = payload["iss"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(TokenError::Malformed)?;
     let exp_str = payload["exp"].as_str().ok_or(TokenError::MissingExp)?;
     let exp = DateTime::parse_from_rfc3339(exp_str)
         .map_err(|_| TokenError::Malformed)?
         .timestamp();
+    let iat_str = payload["iat"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(TokenError::Malformed)?;
+    let iat = DateTime::parse_from_rfc3339(iat_str)
+        .map_err(|_| TokenError::Malformed)?
+        .timestamp();
+    if iat > now_secs() + 60 {
+        return Err(TokenError::Malformed);
+    }
     if exp < now_secs() {
         return Err(TokenError::Expired(exp_str.to_string()));
     }
+    if exp < iat {
+        return Err(TokenError::Malformed);
+    }
 
-    let token_msg_id = payload["msg_id"].as_str().ok_or(TokenError::Malformed)?;
+    let token_msg_id = payload["msg_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(TokenError::Malformed)?;
+    if payload["nonce"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err(TokenError::Malformed);
+    }
     if let Some(required) = required_msg_id {
         if token_msg_id != required {
             return Err(TokenError::MsgIdMismatch {
@@ -221,10 +260,10 @@ pub fn verify_token(
     }
 
     Ok(TokenPayload {
-        iss: payload["iss"].as_str().unwrap_or_default().to_string(),
+        iss: issuer.to_string(),
         aud: aud.to_string(),
         exp: exp_str.to_string(),
-        iat: payload["iat"].as_str().unwrap_or_default().to_string(),
+        iat: iat_str.to_string(),
         msg_id: token_msg_id.to_string(),
         nonce: payload["nonce"].as_str().unwrap_or_default().to_string(),
     })
@@ -304,6 +343,7 @@ impl PeerAuth {
         std::fs::read_to_string(secret_path)
             .ok()
             .map(|s| s.trim().to_string())
+            .filter(|secret| !secret.is_empty())
     }
 }
 
@@ -317,18 +357,27 @@ impl Default for PeerAuth {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Decode a hex secret into key bytes.
-///
-/// Non-hex pairs decode to zero rather than failing, so a raw (non-hex) secret
-/// is still usable as a key as long as both ends read it the same way.
-fn hex_to_bytes(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            let end = (i + 2).min(hex.len());
-            u8::from_str_radix(&hex[i..end], 16).unwrap_or(0)
-        })
+/// Convert an even-length hexadecimal secret to bytes; other secrets are used
+/// as raw UTF-8 bytes.
+fn secret_bytes(secret: &str) -> Vec<u8> {
+    let bytes = secret.as_bytes();
+    if !bytes.len().is_multiple_of(2) || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return bytes.to_vec();
+    }
+
+    bytes
+        .chunks_exact(2)
+        .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
         .collect()
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => unreachable!("hex_nibble only receives hexadecimal input"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +435,17 @@ mod tests {
         let result = verify_token(&token, "wrong_secret", "agent-beta", "server-1", None);
 
         assert!(matches!(result, Err(TokenError::SignatureMismatch)));
+    }
+
+    #[test]
+    fn non_hex_secrets_are_used_as_raw_bytes() {
+        assert_eq!(secret_bytes("raw-secret"), b"raw-secret");
+        assert_eq!(secret_bytes("abc"), b"abc");
+    }
+
+    #[test]
+    fn hexadecimal_secrets_keep_byte_encoding() {
+        assert_eq!(secret_bytes("deadBEEF"), [0xde, 0xad, 0xbe, 0xef]);
     }
 
     #[test]

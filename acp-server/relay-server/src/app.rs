@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use crate::models::{HopTraceEntry, Hops, Peer, SendRequest, SendResponse, TokenClaims};
-use crate::security::{extract_agent_id, verify_token, TokenError};
+use crate::security::{extract_agent_id, secret_bytes, verify_token, TokenError};
 use crate::store::Store;
 
 type HmacSha256 = Hmac<sha2::Sha256>;
@@ -37,6 +37,24 @@ const FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Hop ceiling stamped onto a message that arrives without hop tracking.
 const DEFAULT_MAX_HOPS: u32 = 10;
+
+/// Current ACP wire-protocol version.
+const PROTOCOL_VERSION: &str = "1.1";
+
+/// Wire versions accepted during initialization, newest first.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["1.1", "1.0"];
+
+/// Body of `POST /acp/v1/initialize`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct InitializeRequest {
+    /// Protocol versions the caller can speak, newest first.
+    #[serde(default)]
+    protocol_versions: Vec<String>,
+    /// Features the caller would like to use.
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
 
 /// Everything a handler needs: the store, the signing secret, and the live feed.
 #[derive(Clone)]
@@ -118,10 +136,27 @@ impl IntoResponse for Rejection {
 ///
 /// `allowed` lists the audiences this endpoint accepts. Most only accept the
 /// relay itself; `send_message` also accepts the ultimate recipient.
-fn authorize(headers: &HeaderMap, state: &AppState, allowed: &[&str]) -> Result<String, Rejection> {
+fn authorize(
+    headers: &HeaderMap,
+    state: &AppState,
+    allowed: &[&str],
+) -> Result<TokenClaims, Rejection> {
     let claims = verify_auth(headers, &state.shared_secret).map_err(Rejection::Unauthorized)?;
     check_audience(&claims, allowed).map_err(Rejection::Forbidden)?;
-    Ok(agent_id_from_iss(&claims.iss))
+    Ok(claims)
+}
+
+fn authorize_observability(headers: &HeaderMap, state: &AppState) -> Option<Response> {
+    if std::env::var("ACP_PUBLIC_DEBUG")
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        warn!("ACP_PUBLIC_DEBUG is enabled; exposing relay diagnostics publicly");
+        return None;
+    }
+    authorize(headers, state, &[&state.this_agent_id])
+        .err()
+        .map(IntoResponse::into_response)
 }
 
 // ---- Health ----
@@ -141,20 +176,29 @@ pub async fn register(
     headers: HeaderMap,
     Json(peer): Json<Peer>,
 ) -> Response {
-    let issuer = match authorize(&headers, &state, &[&state.this_agent_id]) {
-        Ok(issuer) => issuer,
+    let claims = match authorize(&headers, &state, &[&state.this_agent_id]) {
+        Ok(claims) => claims,
         Err(rejection) => return rejection.into_response(),
     };
-
+    let issuer = agent_id_from_iss(&claims.iss);
     // A registration rewrites where the relay forwards an agent's messages, so it
     // may only be made in the registrant's own name — otherwise any holder of the
     // shared secret could point another agent's traffic at an endpoint it controls.
-    if issuer != peer.agent_id {
+    let expected_issuer = format!("{}@{}", peer.agent_id, peer.machine_id);
+    if issuer != peer.agent_id || claims.iss != expected_issuer {
         warn!("[REG] {issuer} attempted to register as {}", peer.agent_id);
         return forbidden(&format!(
             "Token issued by {issuer} cannot register {}",
             peer.agent_id
         ));
+    }
+    if !valid_endpoint(&peer.http_endpoint, &["http", "https"])
+        || peer
+            .ws_endpoint
+            .as_deref()
+            .is_some_and(|endpoint| !valid_endpoint(endpoint, &["ws", "wss"]))
+    {
+        return error_resp("INVALID_ENDPOINT", StatusCode::BAD_REQUEST);
     }
 
     info!("[REG] Registering peer: {}", peer.agent_id);
@@ -197,8 +241,17 @@ pub async fn send_message(
 
     // Unlike the relay's own endpoints, a send token may be addressed to the
     // ultimate recipient — the relay is a forwarder on that path, not the target.
-    if let Err(rejection) = authorize(&headers, &state, &[&state.this_agent_id, recipient_agent]) {
-        return rejection.into_response();
+    let claims = match authorize(&headers, &state, &[&state.this_agent_id, recipient_agent]) {
+        Ok(claims) => claims,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let expected_sender = format!(
+        "{}@{}",
+        envelope.sender.agent_id,
+        envelope.sender.machine_id.as_deref().unwrap_or_default()
+    );
+    if claims.iss != expected_sender {
+        return forbidden("Token issuer does not match envelope sender");
     }
 
     info!(
@@ -269,6 +322,14 @@ fn broker(state: &AppState, body: &SendRequest) -> Response {
 async fn forward(state: &AppState, body: &SendRequest, peer: &Peer) -> Response {
     let envelope = &body.envelope;
     let msg_id = &envelope.msg_id;
+    let current_hops = envelope.hops.as_ref().map_or(0, |hops| hops.count);
+    let max_hops = envelope
+        .hops
+        .as_ref()
+        .map_or(DEFAULT_MAX_HOPS, |hops| hops.max);
+    if max_hops == 0 || current_hops >= max_hops {
+        return error_resp("HOP_LIMIT_EXCEEDED", StatusCode::BAD_REQUEST);
+    }
 
     let mut new_envelope = envelope.clone();
     new_envelope.sender.agent_id = state.this_agent_id.clone();
@@ -297,7 +358,19 @@ async fn forward(state: &AppState, body: &SendRequest, peer: &Peer) -> Response 
         &state.shared_secret,
     );
 
-    let result = reqwest::Client::new()
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return error_resp(
+                &format!("FORWARD_CLIENT_ERROR: {error}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+    let result = client
         .post(format!("{}/acp/v1/relay/forward", peer.http_endpoint))
         .json(&serde_json::json!({ "envelope": new_envelope, "payload": body.payload }))
         .header("Authorization", format!("ACP-Token {forward_token}"))
@@ -360,10 +433,11 @@ fn is_connection_failure(error: &reqwest::Error) -> bool {
 
 /// `GET /acp/v1/messages/pending` — collect the messages held for the caller.
 pub async fn get_pending(State(state): State<SharedState>, headers: HeaderMap) -> Response {
-    let agent_id = match authorize(&headers, &state, &[&state.this_agent_id]) {
-        Ok(agent_id) => agent_id,
+    let claims = match authorize(&headers, &state, &[&state.this_agent_id]) {
+        Ok(claims) => claims,
         Err(rejection) => return rejection.into_response(),
     };
+    let agent_id = agent_id_from_iss(&claims.iss);
 
     // Polling is the liveness signal for agents that don't accept pushes; without
     // this their last_seen_at only moves on re-registration and they read as stale.
@@ -384,10 +458,19 @@ pub async fn acknowledge_message(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    let issuer = match authorize(&headers, &state, &[&state.this_agent_id]) {
-        Ok(issuer) => issuer,
+    let claims = match authorize(&headers, &state, &[&state.this_agent_id]) {
+        Ok(claims) => claims,
         Err(rejection) => return rejection.into_response(),
     };
+    let issuer = agent_id_from_iss(&claims.iss);
+    let Some((_stored_sender, stored_recipient)) =
+        state.store.get_message_addresses(&msg_id).ok().flatten()
+    else {
+        return error_resp("NOT_FOUND", StatusCode::NOT_FOUND);
+    };
+    if stored_recipient != issuer {
+        return forbidden("Only the message recipient may acknowledge it");
+    }
 
     // The body is read leniently: callers send differing shapes (`ack_type` +
     // `received`, or the spec's `ack_id`/`processed`/`stream_available`), and some
@@ -464,7 +547,7 @@ pub async fn message_status(
 /// client may need it to negotiate before it can address a token correctly.
 pub async fn capabilities(State(state): State<SharedState>) -> Response {
     with_cors(Json(serde_json::json!({
-        "protocol_version": "1.0",
+        "protocol_version": PROTOCOL_VERSION,
         "agent_id": state.this_agent_id,
         "machine_id": RELAY_MACHINE_ID,
         "role": "relay",
@@ -475,10 +558,65 @@ pub async fn capabilities(State(state): State<SharedState>) -> Response {
     })))
 }
 
+/// `POST /acp/v1/initialize` — authenticate and negotiate protocol features.
+pub async fn initialize(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(body): Json<InitializeRequest>,
+) -> Response {
+    let claims = match authorize(&headers, &state, &[&state.this_agent_id]) {
+        Ok(claims) => claims,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if claims.msg_id != "initialize" {
+        return forbidden("Initialization tokens must be bound to initialize");
+    }
+
+    let protocol_version = SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .find(|version| {
+            body.protocol_versions.is_empty()
+                || body
+                    .protocol_versions
+                    .iter()
+                    .any(|candidate| candidate == **version)
+        })
+        .copied();
+    let Some(protocol_version) = protocol_version else {
+        return error_resp("UNSUPPORTED_PROTOCOL_VERSION", StatusCode::BAD_REQUEST);
+    };
+
+    let features = ["session-context", "run-context"];
+    let accepted_capabilities: Vec<&str> = body
+        .capabilities
+        .iter()
+        .map(String::as_str)
+        .filter(|capability| features.contains(capability))
+        .collect();
+
+    with_cors(Json(serde_json::json!({
+        "protocol_version": protocol_version,
+        "server_protocol_version": PROTOCOL_VERSION,
+        "supported_protocol_versions": SUPPORTED_PROTOCOL_VERSIONS,
+        "role": "relay",
+        "agent_id": state.this_agent_id,
+        "machine_id": RELAY_MACHINE_ID,
+        "capabilities": ["relay", "registry", "broker"],
+        "accepted_capabilities": accepted_capabilities,
+        "features": features,
+        "intents": ["delegate", "reply", "ack", "error"],
+        "content_types": ["application/json"],
+        "auth": ["signed-token"],
+    })))
+}
+
 // ---- Debug messages ----
 
 /// `GET /acp/v1/debug/messages` — recent traffic, for the dashboard.
-pub async fn debug_messages(State(state): State<SharedState>) -> Response {
+pub async fn debug_messages(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Some(response) = authorize_observability(&headers, &state) {
+        return response;
+    }
     let messages = state.store.get_all_messages().unwrap_or_default();
     with_cors(Json(serde_json::json!({ "messages": messages })))
 }
@@ -493,7 +631,14 @@ pub async fn cors_preflight() -> impl IntoResponse {
 // ---- WebSocket live stream ----
 
 /// `GET /acp/stream/live` — subscribe to message and status events.
-pub async fn ws_live(ws: WebSocketUpgrade, State(state): State<SharedState>) -> Response {
+pub async fn ws_live(
+    ws: WebSocketUpgrade,
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = authorize_observability(&headers, &state) {
+        return response;
+    }
     ws.on_upgrade(move |socket| ws_handler(socket, state))
 }
 
@@ -569,6 +714,18 @@ fn agent_id_from_iss(iss: &str) -> String {
     extract_agent_id(iss)
 }
 
+fn valid_endpoint(endpoint: &str, schemes: &[&str]) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    schemes.contains(&url.scheme())
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
 /// Confirm a token was minted for one of `allowed` audiences.
 ///
 /// Only the `agent_id` half of `aud` is compared. Peers derive the machine half
@@ -618,18 +775,6 @@ fn iso_from_epoch(secs: f64) -> String {
 
 // ---- Token creation ----
 
-/// Decode a hex secret into key bytes; see `security::hex_to_bytes` for the
-/// tolerance rules, which both halves of the scheme must agree on.
-fn hex_to_bytes(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            let end = (i + 2).min(hex.len());
-            u8::from_str_radix(&hex[i..end], 16).unwrap_or(0)
-        })
-        .collect()
-}
-
 /// Mint a token binding `msg_id` to an issuer/audience pair.
 ///
 /// Used for relay-signed forwards, and by the tests in [`crate::security`].
@@ -674,7 +819,7 @@ pub fn create_token(
         serde_json::to_vec(&payload).expect("json! value with string keys always serializes");
     let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_bytes);
 
-    let mut mac = HmacSha256::new_from_slice(&hex_to_bytes(secret))
+    let mut mac = HmacSha256::new_from_slice(&secret_bytes(secret))
         .expect("HMAC-SHA256 accepts a key of any size");
     mac.update(format!("{header_b64}.{payload_b64}").as_bytes());
     let sig_b64 = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes().as_slice());
@@ -689,6 +834,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/acp/v1/capabilities", get(capabilities))
+        .route("/acp/v1/initialize", post(initialize))
         .route("/acp/v1/agents/register", post(register))
         .route("/acp/v1/messages/{msg_id}/status", get(message_status))
         .route("/acp/v1/peers", get(get_peers))
@@ -744,5 +890,25 @@ mod tests {
     #[test]
     fn an_unreadable_epoch_renders_as_an_empty_string() {
         assert_eq!(iso_from_epoch(f64::MAX), "");
+    }
+
+    #[test]
+    fn peer_endpoints_must_be_absolute_and_credential_free() {
+        assert!(valid_endpoint(
+            "https://agent.example.test:8444",
+            &["http", "https"]
+        ));
+        assert!(!valid_endpoint(
+            "agent.example.test:8444",
+            &["http", "https"]
+        ));
+        assert!(!valid_endpoint(
+            "https://user:password@agent.example.test",
+            &["http", "https"]
+        ));
+        assert!(!valid_endpoint(
+            "https://agent.example.test/path?token=secret",
+            &["http", "https"]
+        ));
     }
 }

@@ -79,7 +79,10 @@ impl SignalingConfig {
 }
 
 fn required_env(name: &'static str) -> Result<String, SignalingError> {
-    std::env::var(name).map_err(|_| SignalingError::MissingEnv(name))
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or(SignalingError::MissingEnv(name))
 }
 
 // ---------------------------------------------------------------------------

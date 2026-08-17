@@ -55,7 +55,7 @@ impl Store {
         })
     }
 
-    /// Insert a message, or refresh the payload of one already stored.
+    /// Insert a message without replacing an existing message with the same ID.
     ///
     /// # Errors
     /// Returns the `rusqlite` error when the insert fails.
@@ -79,10 +79,7 @@ impl Store {
                 intent, content_type, priority, payload, envelope_json,
                 created_at, deadline, error, status, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(msg_id) DO UPDATE SET
-                   envelope_json = excluded.envelope_json,
-                   payload = excluded.payload,
-                   updated_at = excluded.updated_at",
+               ON CONFLICT(msg_id) DO NOTHING",
             params![
                 msg_id,
                 envelope.corr_id.as_deref().unwrap_or(msg_id),
@@ -172,6 +169,21 @@ impl Store {
         }
     }
 
+    /// Return the sender and recipient recorded for one message.
+    ///
+    /// # Errors
+    /// Returns the `SQLite` error when the query fails.
+    pub fn get_message_addresses(&self, msg_id: &str) -> SqlResult<Option<(String, String)>> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT sender_agent, recipient_agent FROM messages WHERE msg_id = ?")?;
+        let mut rows = stmt.query(params![msg_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+            None => Ok(None),
+        }
+    }
+
     /// The most recent messages, as JSON for the dashboard.
     ///
     /// Capped at the 50 most recent; rows that fail to read are skipped.
@@ -182,24 +194,31 @@ impl Store {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT msg_id, corr_id, recipient_agent, sender_agent, intent, status, error, payload,
-                    created_at, updated_at
+                    envelope_json, created_at, updated_at
               FROM messages
               ORDER BY updated_at DESC
               LIMIT ?",
         )?;
         let rows = stmt.query_map(params![DEBUG_MESSAGE_LIMIT], |row| {
             let payload: Option<String> = row.get(7)?;
+            let envelope: serde_json::Value = row
+                .get::<_, String>(8)
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or(serde_json::Value::Null);
             Ok(serde_json::json!({
                 "msg_id": row.get::<_, String>(0)?,
                 "corr_id": row.get::<_, String>(1)?,
+                "session_id": envelope.get("session_id"),
+                "run_id": envelope.get("run_id"),
                 "recipient_agent": row.get::<_, String>(2)?,
                 "sender_agent": row.get::<_, String>(3)?,
                 "intent": row.get::<_, String>(4)?,
                 "status": row.get::<_, String>(5)?,
                 "error": row.get::<_, Option<String>>(6)?,
                 "payload": payload.and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok()),
-                "created_at": row.get::<_, f64>(8)?,
-                "updated_at": row.get::<_, f64>(9)?,
+                "created_at": row.get::<_, f64>(9)?,
+                "updated_at": row.get::<_, f64>(10)?,
             }))
         })?;
         Ok(rows.flatten().collect())
@@ -387,6 +406,8 @@ mod tests {
         Envelope {
             msg_id: msg_id.to_string(),
             corr_id: None,
+            session_id: None,
+            run_id: None,
             origin: None,
             sender: AgentAddr {
                 agent_id: "agent-alpha".to_string(),

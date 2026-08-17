@@ -88,6 +88,8 @@ acp-agent doctor [--target <agent-id>]
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/health` | Status plus `this_agent_id` / `this_machine_id` |
+| `GET` | `/acp/v1/capabilities` | Public protocol capabilities |
+| `POST` | `/acp/v1/initialize` | Authenticated version and feature negotiation |
 | `GET` | `/acp/v1/peers` | Peers from the loaded config |
 | `GET` | `/acp/v1/messages/pending` | Inbox and pending outgoing messages |
 | `GET` | `/acp/v1/debug/messages` | Same message list, unwrapped, for debugging |
@@ -149,6 +151,7 @@ timeouts:
 | `ACP_MACHINE_ID` | This machine's ID |
 | `ACP_HTTP_ENDPOINT` | Public URL of this agent |
 | `ACP_POLL_INTERVAL` | Relay poll interval (seconds) |
+| `ACP_PUBLIC_DEBUG` | Development-only bypass for diagnostics; never enable on a reachable deployment |
 
 ## Protocol
 

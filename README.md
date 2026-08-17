@@ -1,6 +1,6 @@
 # ACP
 
-ACP (Agent Communication Protocol) is a self-hosted request/reply protocol for delegating work between agents on different machines. Messages use JSON envelopes, correlation IDs, hop-by-hop acknowledgements, signed authentication, and a reply path that routes results back through the delegation chain.
+ACP (Agent Communication Protocol) is a self-hosted request/reply protocol for delegating work between agents on different machines. ACP 1.1 adds authenticated protocol negotiation and explicit session/run context while preserving compatibility with existing message routes. Messages use JSON envelopes, correlation IDs, hop-by-hop acknowledgements, signed authentication, and a reply path that routes results back through the delegation chain.
 
 ## Repository layout
 
@@ -28,7 +28,22 @@ Human → Agent A → Relay/Agent B → Agent C
                  reply path
 ```
 
-Each message contains an `origin`, `sender`, `recipient`, `corr_id`, and ordered `reply_to.path`. An agent only needs to know its immediate peers; replies are forwarded hop by hop. The protocol supports delegation, replies, errors, acknowledgements, and WebSocket stream frames.
+Each message contains an `origin`, `sender`, `recipient`, `corr_id`, optional `session_id` and `run_id`, and ordered `reply_to.path`. An agent only needs to know its immediate peers; replies are forwarded hop by hop. The protocol supports delegation, replies, errors, acknowledgements, and WebSocket stream frames.
+
+`msg_id` identifies one message, `corr_id` groups a request and its replies, `session_id` identifies a user or automation conversation, and `run_id` identifies one execution within that session. Session and run IDs are optional on the wire and are preserved when a message is forwarded or answered.
+
+Before sending work, a client can call `POST /acp/v1/initialize` to authenticate the peer and negotiate a shared protocol version. The current implementation accepts `1.1` and `1.0`, selecting the newest version supported by both sides. The handshake also advertises lifecycle and streaming features.
+
+Example initialization request:
+
+```json
+{
+  "protocol_versions": ["1.1", "1.0"],
+  "capabilities": ["session-context", "run-context", "streaming"]
+}
+```
+
+The request must use an ACP signed token bound to `msg_id: "initialize"`. `/health` and `/acp/v1/capabilities` are unauthenticated discovery endpoints; peer, message, stream, diagnostics, and initialization endpoints require authentication.
 
 ## Requirements
 
@@ -79,6 +94,8 @@ A running agent exposes:
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/health` | Status plus this agent's `this_agent_id` / `this_machine_id` |
+| `GET` | `/acp/v1/capabilities` | Public protocol capabilities |
+| `POST` | `/acp/v1/initialize` | Authenticated version and feature negotiation |
 | `GET` | `/acp/v1/peers` | Peers from the loaded config |
 | `GET` | `/acp/v1/messages/pending` | Inbox and pending outgoing messages |
 | `GET` | `/acp/v1/debug/messages` | Same message list, unwrapped, for debugging |
@@ -88,6 +105,14 @@ A running agent exposes:
 | `POST` | `/acp/v1/stream/init` | Open a stream for a large reply |
 
 The dashboard talks to these endpoints, so it can point at either an agent or the relay.
+
+The relay exposes the same capabilities and initialization endpoints. It additionally provides brokered delivery for unreachable agents and `GET /acp/stream/live` for authenticated live dashboard events.
+
+Message, peer, pending, status, debug, acknowledgment, error, stream, and initialization endpoints
+require an ACP signed token bound to the request. The Vite development proxy adds
+a dashboard token when `ACP_SHARED_SECRET` is set. `ACP_PUBLIC_DEBUG=true` is an
+explicit development-only escape hatch for dashboard diagnostics; do not enable it
+on a network-reachable deployment.
 
 ## Dashboard
 
@@ -121,7 +146,7 @@ peers:
       secret_path: /etc/acp/shared-secret.key
 ```
 
-Use HTTPS/WSS outside a trusted local network. The protocol supports HMAC-signed tokens by default and mTLS for higher-security deployments.
+Use HTTPS/WSS outside a trusted local network. The protocol supports HMAC-signed tokens by default and mTLS for higher-security deployments. A secret that is a valid even-length hexadecimal string is decoded as bytes; any other secret is used as UTF-8 bytes.
 
 ## Documentation
 

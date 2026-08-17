@@ -14,7 +14,10 @@ function dashboardToken(secret: string) {
     msg_id: `dashboard_${randomUUID()}`, nonce: randomUUID(),
   }));
   const input = `${header}.${payload}`;
-  const signature = createHmac('sha256', Buffer.from(secret, 'hex')).update(input).digest('base64url');
+  const key = /^[0-9a-f]+$/i.test(secret) && secret.length % 2 === 0
+    ? Buffer.from(secret, 'hex')
+    : Buffer.from(secret, 'utf8');
+  const signature = createHmac('sha256', key).update(input).digest('base64url');
   return `${input}.${signature}`;
 }
 

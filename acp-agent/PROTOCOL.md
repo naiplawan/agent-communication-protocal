@@ -1,6 +1,6 @@
 # ACP — Agent Communication Protocol Specification
 
-> **Version 1.0** — Source of truth for the ACP implementation.
+> **Version 1.1** — Source of truth for the ACP implementation.
 
 ---
 
@@ -27,6 +27,8 @@ Every ACP message is a JSON envelope wrapping a payload:
   "envelope": {
     "msg_id": "msg_a1b2c3d4",
     "corr_id": "msg_a1b2c3d4",
+    "session_id": "ses_01jabc...",
+    "run_id": "run_01jabc...",
     "origin": {
       "agent_id": "agent-alpha",
       "machine_id": "laptop-1",
@@ -64,6 +66,8 @@ Every ACP message is a JSON envelope wrapping a payload:
 |-------|----------|-------------|
 | `msg_id` | Yes | Globally unique message ID (ULID, prefixed `msg_`) |
 | `corr_id` | Yes | Correlation ID — the `msg_id` of the originating request |
+| `session_id` | No | Stable ID for the user or automation conversation; preserved across hops and replies |
+| `run_id` | No | ID for one execution within the session; preserved across hops and replies |
 | `origin` | Yes | Who initiated the chain |
 | `sender` | Yes | Current forwarder of this message |
 | `recipient` | Yes | Next-hop recipient |
@@ -80,6 +84,38 @@ Every ACP message is a JSON envelope wrapping a payload:
 ---
 
 ## HTTP/REST Endpoints
+
+### `POST /acp/v1/initialize`
+
+Authenticate a peer and negotiate a common protocol version before sending work. Existing message routes remain available without initialization for backward compatibility.
+
+**Request:**
+```json
+{
+  "protocol_versions": ["1.1", "1.0"],
+  "capabilities": ["session-context", "run-context", "streaming"]
+}
+```
+
+The request uses `Authorization: ACP-Token ...` with the token bound to `msg_id` `initialize`.
+
+**Response (200):**
+```json
+{
+  "protocol_version": "1.1",
+  "server_protocol_version": "1.1",
+  "supported_protocol_versions": ["1.1", "1.0"],
+  "role": "agent",
+  "agent_id": "agent-beta",
+  "machine_id": "server-1",
+  "capabilities": ["delegation"],
+  "accepted_capabilities": ["session-context", "run-context", "streaming"],
+  "features": ["session-context", "run-context", "streaming"],
+  "auth": ["signed-token"]
+}
+```
+
+If no requested version overlaps the server's supported versions, the response is `400` with `UNSUPPORTED_PROTOCOL_VERSION`.
 
 ### `POST /acp/v1/messages/send`
 
@@ -159,6 +195,8 @@ Initiate a WebSocket stream.
 {
   "msg_id": "msg_a1b2c3d4",
   "corr_id": "msg_a1b2c3d4",
+  "session_id": "ses_01jabc...",
+  "run_id": "run_01jabc...",
   "stream_type": "reply"
 }
 ```
@@ -189,6 +227,8 @@ wss://{host}/acp/stream/{stream_id}?token={stream_token}
     "stream_id": "str_abc123",
     "msg_id": "msg_a1b2c3d4",
     "corr_id": "msg_a1b2c3d4",
+    "session_id": "ses_01jabc...",
+    "run_id": "run_01jabc...",
     "seq": 0,
     "total": 5,
     "final": false,

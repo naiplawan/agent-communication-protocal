@@ -18,6 +18,12 @@ pub struct Envelope {
     /// Groups every message belonging to one exchange.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corr_id: Option<String>,
+    /// User or automation conversation this message belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// One execution within `session_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     /// Who started the chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<AgentAddr>,

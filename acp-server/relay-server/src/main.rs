@@ -43,7 +43,9 @@ async fn main() -> ExitCode {
 
 async fn serve() -> anyhow::Result<()> {
     let shared_secret = std::env::var("ACP_SHARED_SECRET")
-        .map_err(|_| anyhow::anyhow!("ACP_SHARED_SECRET must be set"))?;
+        .ok()
+        .filter(|secret| !secret.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("ACP_SHARED_SECRET must be set and non-empty"))?;
     let db_path =
         std::env::var("ACP_DB_PATH").unwrap_or_else(|_| "/tmp/acp-messages.db".to_string());
     let port: u16 = std::env::var("ACP_PORT")
